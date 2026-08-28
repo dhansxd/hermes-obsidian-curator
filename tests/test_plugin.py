@@ -204,6 +204,21 @@ def test_setup_quotes_arbitrary_vault_path_in_prompt(tmp_path, monkeypatch):
     assert f"at:\n{vault.resolve()}" not in goal
 
 
+def test_context_stays_under_native_lifecycle_limit_and_keeps_latest_turn():
+    plugin = load_plugin()
+    history = [
+        {"role": "user", "content": "old" * 12000},
+        {"role": "assistant", "content": "latest durable fact"},
+    ]
+
+    context = plugin._format_context(history)
+
+    assert context is not None
+    assert len(context) <= 32000
+    assert "latest durable fact" in context
+    assert "prior history truncated" in context
+
+
 def test_setup_rejects_non_directory():
     plugin = load_plugin()
     ctx = Context()
