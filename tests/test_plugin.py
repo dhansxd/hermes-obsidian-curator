@@ -51,9 +51,13 @@ class Context:
         return self._parent_agent
 
     def get_config(self, key, default=None):
+        if key in ("model", "plugins", "security", "settings"):
+            raise ValueError(f"Reserved key {key}")
         return self.config.get(key, default)
 
     def set_config(self, key, value):
+        if key in ("model", "plugins", "security", "settings"):
+            raise ValueError(f"Reserved key {key}")
         self.config[key] = value
 
     def register_hook(self, name, fn):
@@ -777,7 +781,7 @@ def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
     assert ctx.config["allowed_toolsets"] == ["file", "skills"]
     assert ctx.config["blocked_tools"] == ["terminal"]
     assert ctx.config["skills"] == ["obsidian", "grounded-citations"]
-    assert ctx.config["model"] == "claude-3-5-sonnet-20241022"
+    assert ctx.config["model_override"] == "claude-3-5-sonnet-20241022"
 
     req = ctx.subagent_lifecycle.requests[0]
     assert req.allowed_toolsets == ("file", "skills")

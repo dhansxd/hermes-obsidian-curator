@@ -172,7 +172,7 @@ def _settings(ctx: Any) -> dict[str, Any]:
         "allowed_toolsets": ctx.get_config("allowed_toolsets"),
         "blocked_tools": ctx.get_config("blocked_tools", []),
         "skills": ctx.get_config("skills", []),
-        "model": ctx.get_config("model"),
+        "model_override": ctx.get_config("model_override"),
     }
 
 
@@ -249,7 +249,7 @@ def _launch(
     if allowed_toolsets is not None:
         allowed_toolsets = tuple(str(t) for t in allowed_toolsets)
     skills = tuple(str(s) for s in (settings.get("skills") or []))
-    model_override = settings.get("model")
+    model_override = settings.get("model_override")
     if model_override:
         model_override = str(model_override).strip() or None
 
@@ -490,7 +490,7 @@ def _tool(
             )
         if "model" in args:
             raw_model = str(args.get("model") or "").strip()
-            ctx.set_config("model", raw_model or None)
+            ctx.set_config("model_override", raw_model or None)
         _launch(session_id, initial_setup=True, conversation_history=history)
         return tool_result(ok=True, status="active", vault_path=str(vault))
 
