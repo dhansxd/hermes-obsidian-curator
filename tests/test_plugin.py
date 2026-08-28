@@ -699,14 +699,13 @@ def test_session_history_cache_captures_exact_recent_messages_for_interval(tmp_p
     assert len(ctx.subagent_lifecycle.requests) == 1
     req = ctx.subagent_lifecycle.requests[0]
     assert req.context is not None
-    assert "Turn 1: Decision on architecture." in req.context
-    assert "Turn 1 ack." in req.context
-    assert "Turn 2: Research findings." in req.context
+    assert "Turn 1: Decision on architecture." not in req.context
+    assert "Turn 2: Research findings." not in req.context
     assert "Turn 2 ack." in req.context
     assert "Turn 3: Project state changed to active." in req.context
     assert "Turn 3 ack." in req.context
-    assert req.context.count("\nuser:") + req.context.startswith("user:") == 3
-    assert req.context.count("\nassistant:") == 3
+    assert req.context.count("\nuser:") + req.context.startswith("user:") == 1
+    assert req.context.count("\nassistant:") == 2
 
 
 def test_initial_mapping_prompt_is_universal_without_hardcoded_file_names(tmp_path, monkeypatch):

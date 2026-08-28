@@ -270,7 +270,7 @@ def _launch(
                         initial_setup=initial_setup,
                         skills=skills,
                     ),
-                    context=_format_context(history, limit=(interval * 2) if not initial_setup else None),
+                    context=_format_context(history, limit=interval if not initial_setup else None),
                     role="orchestrator",
                     allowed_toolsets=allowed_toolsets,
                     model=model_override,
