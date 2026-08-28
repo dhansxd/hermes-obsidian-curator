@@ -194,7 +194,13 @@ def test_setup_passes_parent_context_when_available(tmp_path, monkeypatch):
 def test_subsequent_activity_triggers_review_without_initial_setup_prompt(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
     plugin.register(ctx)
 
     ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", conversation_history=[])
@@ -211,7 +217,13 @@ def test_completed_tool_calls_share_activity_counter_with_completed_turns(tmp_pa
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
     monkeypatch.setattr(plugin, "_resolve_origin_target", lambda session_id, platform="": None)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 3})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 3,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
     plugin.register(ctx)
 
     ctx.hooks["post_tool_call"](session_id="s1", tool_name="read_file")
@@ -243,7 +255,13 @@ def test_curator_child_tool_calls_are_ignored_for_anti_loop(tmp_path, monkeypatc
 def test_activity_counter_resets_on_first_turn_of_active_child(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
     plugin.register(ctx)
 
     ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", conversation_history=[])
@@ -274,7 +292,13 @@ def test_curator_child_activity_is_ignored_for_anti_loop(tmp_path, monkeypatch):
 def test_unrelated_subagent_still_increments_counter(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
     plugin.register(ctx)
     setattr(plugin, "_ACTIVE_CHILD", "curator-child-1")
 
@@ -290,7 +314,13 @@ def test_launch_binds_origin_target_to_started_child(tmp_path, monkeypatch):
         "_resolve_origin_target",
         lambda session_id, platform="": "discord:123:456",
     )
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
     plugin.register(ctx)
 
     ctx.hooks["post_llm_call"](
@@ -471,6 +501,31 @@ def test_end_to_end_setup_hybrid_trigger_and_origin_delivery(tmp_path, monkeypat
     periodic = ctx.subagent_lifecycle.requests[1]
     assert "This is the initial setup run" not in periodic.goal
     assert curator_prompt in periodic.goal
+
+
+def test_periodic_launch_is_blocked_if_curator_prompt_missing_or_blank(tmp_path):
+    plugin = load_plugin()
+    ctx = Context()
+    plugin.register(ctx)
+    ctx.set_config("vault_path", str(tmp_path))
+    ctx.set_config("review_interval", 1)
+    # curator_prompt not configured yet
+    ctx.hooks["post_llm_call"](session_id="parent-1", platform="telegram")
+    assert len(ctx.subagent_lifecycle.requests) == 0
+
+
+def test_resolve_origin_target_requires_both_platform_and_chat_id(monkeypatch):
+    import sys
+    plugin = load_plugin()
+    fake_ctx = SimpleNamespace(
+        get_session_env=lambda key, default="": {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_CHAT_ID": "",
+            "HERMES_SESSION_THREAD_ID": "",
+        }.get(key, default)
+    )
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_ctx)
+    assert plugin._resolve_origin_target("sess", "") is None
 
 
 def test_manifest_is_valid():

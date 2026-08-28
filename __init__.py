@@ -40,8 +40,6 @@ def _resolve_origin_target(session_id: str, platform: str = "") -> str | None:
         thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
         if plat and chat_id:
             return f"{plat}:{chat_id}:{thread_id}" if thread_id else f"{plat}:{chat_id}"
-        if plat:
-            return plat
     except Exception:
         pass
     return None
@@ -165,6 +163,9 @@ def _launch(
     vault_value = _settings(ctx).get("vault_path", "")
     vault = Path(str(vault_value)).expanduser().resolve()
     if not vault.is_dir():
+        return False
+    curator_prompt = str(_settings(ctx).get("curator_prompt") or "").strip()
+    if not curator_prompt:
         return False
     with _LOCK:
         if _LAUNCHING or _ACTIVE_CHILD:
