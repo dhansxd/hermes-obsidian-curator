@@ -131,6 +131,8 @@ def _settings(ctx: Any) -> dict[str, Any]:
         "vault_path": ctx.get_config("vault_path", ""),
         "review_interval": ctx.get_config("review_interval"),
         "curator_prompt": ctx.get_config("curator_prompt", ""),
+        "trigger_on_turns": ctx.get_config("trigger_on_turns", True),
+        "trigger_on_tools": ctx.get_config("trigger_on_tools", True),
     }
 
 
@@ -263,7 +265,7 @@ def _review_interval(ctx: Any) -> int | None:
     return value if value > 0 else None
 
 
-def _record_activity(event: dict[str, Any]) -> None:
+def _record_activity(event: dict[str, Any], *, source_type: str) -> None:
     ctx = _CTX
     if ctx is None:
         return
@@ -271,7 +273,12 @@ def _record_activity(event: dict[str, Any]) -> None:
     with _LOCK:
         if session_id and session_id == _ACTIVE_CHILD:
             return
-        if not _settings(ctx).get("vault_path", ""):
+        settings = _settings(ctx)
+        if not settings.get("vault_path", ""):
+            return
+        if source_type == "turn" and not bool(settings["trigger_on_turns"]):
+            return
+        if source_type == "tool" and not bool(settings["trigger_on_tools"]):
             return
         interval = _review_interval(ctx)
         if interval is None:
@@ -289,11 +296,11 @@ def _record_activity(event: dict[str, Any]) -> None:
 
 
 def _on_post_llm_call(**event: Any) -> None:
-    _record_activity(event)
+    _record_activity(event, source_type="turn")
 
 
 def _on_post_tool_call(**event: Any) -> None:
-    _record_activity(event)
+    _record_activity(event, source_type="tool")
 
 
 def _tool(
@@ -332,6 +339,10 @@ def _tool(
         ctx.set_config("vault_path", str(vault))
         ctx.set_config("review_interval", interval)
         ctx.set_config("curator_prompt", curator_prompt)
+        if "trigger_on_turns" in args:
+            ctx.set_config("trigger_on_turns", bool(args["trigger_on_turns"]))
+        if "trigger_on_tools" in args:
+            ctx.set_config("trigger_on_tools", bool(args["trigger_on_tools"]))
         _launch(session_id, initial_setup=True, conversation_history=history)
         return tool_result(ok=True, status="active", vault_path=str(vault))
 
@@ -362,6 +373,14 @@ def register(ctx: Any) -> None:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 12000,
+                    },
+                    "trigger_on_turns": {
+                        "type": "boolean",
+                        "description": "Whether completed conversation turns count towards review_interval (default: true).",
+                    },
+                    "trigger_on_tools": {
+                        "type": "boolean",
+                        "description": "Whether completed tool calls count towards review_interval (default: true).",
                     },
                 },
                 "required": [
