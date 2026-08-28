@@ -1,5 +1,5 @@
 name: obsidian-curator
-version: 0.1.3
+version: 0.2.0
 manifest_version: 1
 description: "One full native Hermes background agent whose only task is managing Obsidian."
 author: Dani & Dyra
@@ -8,6 +8,7 @@ provides_tools:
 provides_hooks:
   - pre_llm_call
   - post_llm_call
+  - post_tool_call
   - subagent_start
   - subagent_stop
 config_schema:
@@ -16,4 +17,7 @@ config_schema:
     description: "Absolute path to the Obsidian vault."
   review_interval:
     type: int
-    description: "Number of eligible Hermes activity turns between background reviews."
+    description: "Number of eligible completed turns and tool calls between background reviews."
+  curator_prompt:
+    type: str
+    description: "User- and agent-defined instructions for managing this specific vault."

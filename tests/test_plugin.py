@@ -71,7 +71,12 @@ def test_setup_launches_native_agent_with_recursive_mapping_prompt(tmp_path, mon
 
     result = json.loads(
         ctx.tools["obsidian_curator"](
-            {"operation": "setup", "vault_path": str(tmp_path), "review_interval": 3}
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 3,
+                "curator_prompt": "Audit and curate vault.",
+            }
         )
     )
 
@@ -85,6 +90,76 @@ def test_setup_launches_native_agent_with_recursive_mapping_prompt(tmp_path, mon
     assert "search_files with pagination" in req.goal
     assert "Read every readable vault file completely with read_file" in req.goal
     assert "Do not write or patch anything until this full-vault mapping is complete." in req.goal
+
+
+def test_setup_stores_and_uses_user_defined_curator_prompt(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(plugin, "_resolve_origin_target", lambda session_id, platform="": None)
+    ctx = Context()
+    plugin.register(ctx)
+    curator_prompt = (
+        "Follow this vault's own HERMES.md and Home.md. Audit canonical notes, "
+        "duplicates, stale content, broken links, misplaced notes, corrections, "
+        "moves, archives, and deletions. Never record session content blindly."
+    )
+
+    result = json.loads(
+        ctx.tools["obsidian_curator"](
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 3,
+                "curator_prompt": curator_prompt,
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert ctx.config["curator_prompt"] == curator_prompt
+    assert curator_prompt in ctx.subagent_lifecycle.requests[0].goal
+
+
+def test_setup_rejects_blank_curator_prompt(tmp_path):
+    plugin = load_plugin()
+    ctx = Context()
+    plugin.register(ctx)
+
+    result = json.loads(
+        ctx.tools["obsidian_curator"](
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 3,
+                "curator_prompt": "   ",
+            }
+        )
+    )
+
+    assert result == {"error": "curator_prompt must be a non-empty string."}
+    assert "vault_path" not in ctx.config
+
+
+def test_setup_rejects_overly_long_curator_prompt(tmp_path):
+    plugin = load_plugin()
+    ctx = Context()
+    plugin.register(ctx)
+
+    result = json.loads(
+        ctx.tools["obsidian_curator"](
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 3,
+                "curator_prompt": "A" * 12001,
+            }
+        )
+    )
+
+    assert result == {
+        "error": "curator_prompt must be at most 12000 characters."
+    }
+    assert "vault_path" not in ctx.config
 
 
 def test_setup_passes_parent_context_when_available(tmp_path, monkeypatch):
@@ -101,7 +176,12 @@ def test_setup_passes_parent_context_when_available(tmp_path, monkeypatch):
     plugin.register(ctx)
 
     ctx.tools["obsidian_curator"](
-        {"operation": "setup", "vault_path": str(tmp_path), "review_interval": 3},
+        {
+            "operation": "setup",
+            "vault_path": str(tmp_path),
+            "review_interval": 3,
+            "curator_prompt": "Audit and curate vault.",
+        },
         parent_agent=parent,
     )
 
@@ -125,6 +205,39 @@ def test_subsequent_activity_triggers_review_without_initial_setup_prompt(tmp_pa
     assert len(ctx.subagent_lifecycle.requests) == 1
     req = ctx.subagent_lifecycle.requests[0]
     assert "This is the initial setup run" not in req.goal
+
+
+def test_completed_tool_calls_share_activity_counter_with_completed_turns(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(plugin, "_resolve_origin_target", lambda session_id, platform="": None)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 3})
+    plugin.register(ctx)
+
+    ctx.hooks["post_tool_call"](session_id="s1", tool_name="read_file")
+    ctx.hooks["post_llm_call"](
+        session_id="s1", platform="telegram", conversation_history=[]
+    )
+    assert ctx.state.get("activity_count") == 2
+    assert not ctx.subagent_lifecycle.requests
+
+    ctx.hooks["post_tool_call"](session_id="s1", tool_name="search_files")
+    assert len(ctx.subagent_lifecycle.requests) == 1
+
+
+def test_curator_child_tool_calls_are_ignored_for_anti_loop(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1})
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "curator-child-1")
+
+    ctx.hooks["post_tool_call"](
+        session_id="curator-child-1", tool_name="read_file"
+    )
+
+    assert not ctx.subagent_lifecycle.requests
+    assert ctx.state.get("activity_count", 0) == 0
 
 
 def test_activity_counter_resets_on_first_turn_of_active_child(tmp_path, monkeypatch):
@@ -169,13 +282,46 @@ def test_unrelated_subagent_still_increments_counter(tmp_path, monkeypatch):
     assert ctx.state.get("activity_count") == 1
 
 
-def test_subagent_stop_resets_active_child_and_notifies(monkeypatch):
+def test_launch_binds_origin_target_to_started_child(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(
+        plugin,
+        "_resolve_origin_target",
+        lambda session_id, platform="": "discord:123:456",
+    )
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2})
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="parent-1", platform="discord", conversation_history=[]
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="parent-1", platform="discord", conversation_history=[]
+    )
+    req = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](
+        child_session_id="curator-child-1", child_goal=req.goal
+    )
+
+    assert plugin._ORIGIN_TARGETS["curator-child-1"] == "discord:123:456"
+
+
+def test_subagent_stop_delivers_notification_to_origin_platform_target(monkeypatch):
     plugin = load_plugin()
     ctx = Context()
-    notices = []
-    monkeypatch.setattr(plugin, "_parent_review_callback", notices.append)
+    sent_messages = []
+
+    def mock_send(args):
+        sent_messages.append(args)
+        return json.dumps({"success": True})
+
+    monkeypatch.setattr(plugin, "_send_message_tool", mock_send)
     plugin.register(ctx)
+
+    # Set active child with an origin target captured at launch
     setattr(plugin, "_ACTIVE_CHILD", "curator-child-1")
+    plugin._ORIGIN_TARGETS["curator-child-1"] = "telegram:8804634959"
 
     ctx.hooks["subagent_stop"](
         child_session_id="curator-child-1",
@@ -184,7 +330,14 @@ def test_subagent_stop_resets_active_child_and_notifies(monkeypatch):
     )
 
     assert getattr(plugin, "_ACTIVE_CHILD") is None
-    assert notices == ["Obsidian: updated coastal restoration note."]
+    assert sent_messages == [
+        {
+            "action": "send",
+            "target": "telegram:8804634959",
+            "message": "Obsidian: updated coastal restoration note.",
+        }
+    ]
+
 
 
 def test_setup_quotes_arbitrary_vault_path_in_prompt(tmp_path, monkeypatch):
@@ -196,7 +349,12 @@ def test_setup_quotes_arbitrary_vault_path_in_prompt(tmp_path, monkeypatch):
     plugin.register(ctx)
 
     ctx.tools["obsidian_curator"](
-        {"operation": "setup", "vault_path": str(vault), "review_interval": 3}
+        {
+            "operation": "setup",
+            "vault_path": str(vault),
+            "review_interval": 3,
+            "curator_prompt": "Audit and curate vault.",
+        }
     )
 
     goal = ctx.subagent_lifecycle.requests[0].goal
@@ -226,7 +384,12 @@ def test_setup_rejects_non_directory():
 
     result = json.loads(
         ctx.tools["obsidian_curator"](
-            {"operation": "setup", "vault_path": "/path/does/not/exist/ever", "review_interval": 3}
+            {
+                "operation": "setup",
+                "vault_path": "/path/does/not/exist/ever",
+                "review_interval": 3,
+                "curator_prompt": "Audit and curate vault.",
+            }
         )
     )
 
@@ -241,12 +404,73 @@ def test_setup_rejects_invalid_interval(tmp_path):
 
     result = json.loads(
         ctx.tools["obsidian_curator"](
-            {"operation": "setup", "vault_path": str(tmp_path), "review_interval": 0}
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 0,
+                "curator_prompt": "Audit and curate vault.",
+            }
         )
     )
 
     assert result == {"error": "review_interval must be a positive integer."}
     assert "vault_path" not in ctx.config
+
+
+def test_end_to_end_setup_hybrid_trigger_and_origin_delivery(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(
+        plugin,
+        "_resolve_origin_target",
+        lambda session_id, platform="": "telegram:8804634959",
+    )
+    sent = []
+    monkeypatch.setattr(
+        plugin,
+        "_send_message_tool",
+        lambda args: sent.append(args) or json.dumps({"success": True}),
+    )
+    ctx = Context()
+    plugin.register(ctx)
+    curator_prompt = "Follow this vault's own rules and curate it fully."
+
+    result = json.loads(
+        ctx.tools["obsidian_curator"](
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 2,
+                "curator_prompt": curator_prompt,
+            }
+        )
+    )
+    assert result["status"] == "active"
+    initial = ctx.subagent_lifecycle.requests[0]
+    assert "This is the initial setup run" in initial.goal
+    assert curator_prompt in initial.goal
+
+    ctx.hooks["subagent_start"](
+        child_session_id="child-initial", child_goal=initial.goal
+    )
+    ctx.hooks["pre_llm_call"](
+        session_id="child-initial", platform="subagent", is_first_turn=True
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-initial",
+        child_summary="Obsidian: initial curation complete.",
+        child_status="completed",
+    )
+    assert sent[-1]["target"] == "telegram:8804634959"
+
+    ctx.hooks["post_tool_call"](session_id="parent-1", tool_name="read_file")
+    ctx.hooks["post_llm_call"](
+        session_id="parent-1", platform="telegram", conversation_history=[]
+    )
+    assert len(ctx.subagent_lifecycle.requests) == 2
+    periodic = ctx.subagent_lifecycle.requests[1]
+    assert "This is the initial setup run" not in periodic.goal
+    assert curator_prompt in periodic.goal
 
 
 def test_manifest_is_valid():
@@ -256,6 +480,7 @@ def test_manifest_is_valid():
     assert "provides_hooks:" in manifest
     assert "- pre_llm_call" in manifest
     assert "- post_llm_call" in manifest
+    assert "- post_tool_call" in manifest
     assert "- subagent_start" in manifest
     assert "- subagent_stop" in manifest
     assert "vault_path:" in manifest
