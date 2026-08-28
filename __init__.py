@@ -15,6 +15,8 @@ _LOCK = threading.RLock()
 _NOTIFIERS: dict[str, Callable[[str], Any]] = {}
 _ORIGIN_TARGETS: dict[str, str] = {}
 _SESSION_HISTORIES: dict[str, list[dict[str, Any]]] = {}
+_MAX_SESSION_ENTRIES = 64
+_MAX_SESSION_MESSAGES = 100
 _LAUNCHING = False
 _ACTIVE_CHILD: str | None = None
 _PENDING_NOTIFIER: Callable[[str], Any] | None = None
@@ -22,6 +24,8 @@ _PENDING_ORIGIN_TARGET: str | None = None
 _CTX = None
 _parent_review_callback: Callable[[str], Any] | None = None
 _MESSAGE_CHAR_CAP = 12_000
+_DEFAULT_TOOLSETS = ("file", "skills")
+_ALWAYS_BLOCKED_TOOLS = ("skill_manage",)
 
 
 def _send_message_tool(args: dict[str, Any]) -> str:
@@ -37,7 +41,11 @@ def _resolve_origin_target(session_id: str, platform: str = "") -> str | None:
     try:
         from gateway.session_context import get_session_env
 
-        plat = str(platform or get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        plat = (
+            str(platform or get_session_env("HERMES_SESSION_PLATFORM", "") or "")
+            .strip()
+            .lower()
+        )
         chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
         thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
         if plat and chat_id:
@@ -190,20 +198,27 @@ def _update_session_history(
             continue
         role = str(message.get("role") or "").strip()
         content = _message_text(message).strip()
+        if len(content) > _MESSAGE_CHAR_CAP:
+            content = f"{content[:_MESSAGE_CHAR_CAP]}\n[... truncated ...]"
         item = {"role": role, "content": content}
         if role in ("user", "assistant") and content:
             if not normalized or normalized[-1] != item:
                 normalized.append(item)
     with _LOCK:
+        if session_id in _SESSION_HISTORIES:
+            # Reinsert on access so normal dict order acts as a tiny LRU.
+            _SESSION_HISTORIES[session_id] = _SESSION_HISTORIES.pop(session_id)
+        elif len(_SESSION_HISTORIES) >= _MAX_SESSION_ENTRIES:
+            _SESSION_HISTORIES.pop(next(iter(_SESSION_HISTORIES)))
         if replace:
-            _SESSION_HISTORIES[session_id] = normalized[-200:]
+            _SESSION_HISTORIES[session_id] = normalized[-_MAX_SESSION_MESSAGES:]
             return
         existing = _SESSION_HISTORIES.setdefault(session_id, [])
         for item in normalized:
             if not existing or existing[-1] != item:
                 existing.append(item)
-        if len(existing) > 200:
-            _SESSION_HISTORIES[session_id] = existing[-200:]
+        if len(existing) > _MAX_SESSION_MESSAGES:
+            _SESSION_HISTORIES[session_id] = existing[-_MAX_SESSION_MESSAGES:]
 
 
 def _launch(
@@ -235,7 +250,9 @@ def _launch(
             resolver = getattr(ctx, "_parent_agent_resolver", None)
             if callable(resolver):
                 parent = resolver()
-                history = getattr(parent, "messages", None) or getattr(parent, "conversation_history", None)
+                history = getattr(parent, "messages", None) or getattr(
+                    parent, "conversation_history", None
+                )
     settings = _settings(ctx)
     vault_value = settings.get("vault_path", "")
     vault = Path(str(vault_value)).expanduser().resolve()
@@ -245,9 +262,12 @@ def _launch(
     if not curator_prompt:
         return False
     interval = _review_interval(ctx) or 20
-    allowed_toolsets = settings.get("allowed_toolsets")
-    if allowed_toolsets is not None:
-        allowed_toolsets = tuple(str(t) for t in allowed_toolsets)
+    configured_toolsets = settings.get("allowed_toolsets")
+    allowed_toolsets = (
+        tuple(str(t) for t in configured_toolsets)
+        if configured_toolsets
+        else _DEFAULT_TOOLSETS
+    )
     skills = tuple(str(s) for s in (settings.get("skills") or []))
     model_override = settings.get("model_override")
     if model_override:
@@ -270,13 +290,16 @@ def _launch(
                         initial_setup=initial_setup,
                         skills=skills,
                     ),
-                    context=_format_context(history, limit=interval if not initial_setup else None),
-                    role="orchestrator",
+                    context=_format_context(
+                        history, limit=interval if not initial_setup else None
+                    ),
+                    role="leaf",
                     allowed_toolsets=allowed_toolsets,
                     model=model_override,
                     parent_session_id=session_id or None,
                 )
             )
+            ctx.state.set("activity_count", 0)
             return True
         except Exception:
             _ACTIVE_CHILD = None
@@ -308,10 +331,6 @@ def _on_pre_llm_call(**event: Any) -> None:
     if ctx is None:
         return
     session_id = str(event.get("session_id") or "")
-    is_first_turn = event.get("is_first_turn", True)
-    with _LOCK:
-        if session_id and session_id == _ACTIVE_CHILD and is_first_turn:
-            ctx.state.set("activity_count", 0)
     user_message = str(event.get("user_message") or "").strip()
     history = event.get("conversation_history")
     if isinstance(history, list) and history:
@@ -403,12 +422,57 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
     with _LOCK:
         if not session_id or session_id != _ACTIVE_CHILD:
             return None
-        blocked = tuple(str(t) for t in (_settings(ctx).get("blocked_tools") or []))
+        settings = _settings(ctx)
+        blocked = _ALWAYS_BLOCKED_TOOLS + tuple(
+            str(t) for t in (settings.get("blocked_tools") or [])
+        )
         if tool_name and tool_name in blocked:
             return {
                 "action": "block",
                 "message": f"Tool '{tool_name}' is disabled for the Obsidian curator subagent.",
             }
+        vault_raw = str(settings.get("vault_path") or "").strip()
+        if vault_raw and tool_name in (
+            "read_file",
+            "write_file",
+            "patch",
+            "search_files",
+        ):
+            vault_root = Path(vault_raw).expanduser().resolve()
+            args = event.get("args") or {}
+            if tool_name == "search_files" and not args.get("path"):
+                return {
+                    "action": "block",
+                    "message": "Tool 'search_files' requires an explicit path inside the designated Obsidian vault.",
+                }
+            target_paths: list[str] = []
+            if isinstance(args.get("path"), str) and args.get("path"):
+                target_paths.append(str(args["path"]))
+            if tool_name == "patch" and str(args.get("mode") or "replace") == "patch":
+                import re
+
+                for m in re.finditer(
+                    r"^\*\*\*\s*(Update|Add|Delete|Move)\s+File:\s*(.+)$",
+                    str(args.get("patch") or ""),
+                    re.MULTILINE,
+                ):
+                    header_target = m.group(2).strip()
+                    if "->" in header_target:
+                        for segment in header_target.split("->"):
+                            if segment.strip():
+                                target_paths.append(segment.strip())
+                    elif header_target:
+                        target_paths.append(header_target)
+            for raw_target in target_paths:
+                try:
+                    target_resolved = Path(raw_target).expanduser().resolve()
+                    # Must be within vault root or match vault root exactly
+                    target_resolved.relative_to(vault_root)
+                except Exception:
+                    return {
+                        "action": "block",
+                        "message": f"Path '{raw_target}' is outside the designated Obsidian vault.",
+                    }
     return None
 
 
@@ -461,8 +525,14 @@ def _tool(
     if parent_agent is not None:
         session_id = str(getattr(parent_agent, "session_id", "") or "")
         if history is None:
-            history = getattr(parent_agent, "messages", None) or getattr(parent_agent, "conversation_history", None)
+            history = getattr(parent_agent, "messages", None) or getattr(
+                parent_agent, "conversation_history", None
+            )
     with _LOCK:
+        if _LAUNCHING or _ACTIVE_CHILD:
+            return tool_error(
+                "A background curator review is already active. Please wait for it to finish."
+            )
         ctx.set_config("vault_path", str(vault))
         ctx.set_config("review_interval", interval)
         ctx.set_config("curator_prompt", curator_prompt)
@@ -474,7 +544,9 @@ def _tool(
             raw_toolsets = args.get("allowed_toolsets")
             ctx.set_config(
                 "allowed_toolsets",
-                [str(t) for t in raw_toolsets] if isinstance(raw_toolsets, list) else None,
+                [str(t) for t in raw_toolsets]
+                if isinstance(raw_toolsets, list)
+                else None,
             )
         if "blocked_tools" in args:
             raw_blocked = args.get("blocked_tools")
@@ -534,7 +606,7 @@ def register(ctx: Any) -> None:
                     "allowed_toolsets": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Restrict child subagent to specific toolsets (default: null = all native parent toolsets).",
+                        "description": "Toolsets available to the curator (default: file and skills).",
                     },
                     "blocked_tools": {
                         "type": "array",

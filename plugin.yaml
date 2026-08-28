@@ -1,5 +1,5 @@
 name: obsidian-curator
-version: 0.4.2
+version: 0.5.0
 manifest_version: 1
 description: "One full native Hermes background agent whose only task is managing Obsidian."
 author: Dani & Dyra
@@ -32,7 +32,10 @@ config_schema:
     description: "Whether completed tool calls count towards review_interval."
   allowed_toolsets:
     type: list
-    description: "Restrict child curator subagent to specific toolsets (default null = full native parent capabilities)."
+    default:
+      - file
+      - skills
+    description: "Toolsets available to the curator (default: file and skills)."
   blocked_tools:
     type: list
     default: []
@@ -41,6 +44,6 @@ config_schema:
     type: list
     default: []
     description: "List of skills to preload before each curation pass."
-  model:
+  model_override:
     type: str
     description: "Custom model override for the background curator subagent (default null = inherit parent session model)."

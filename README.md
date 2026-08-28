@@ -7,10 +7,11 @@ Native Hermes background review plugin dedicated to managing any Obsidian vault.
 - **Global & Universal:** No hardcoded folder names or structures. Works on any Obsidian vault. On initial setup, recursively maps the vault structure to understand indexes, links, naming conventions, and governance notes.
 - **Accurate History Snapshots:** Captures exact recent conversation turns (`user` & `assistant` messages) so the curator evaluates authentic session facts.
 - **Flexible Capabilities (Cronjob-style):**
-  - **Full native tools by default** (or restricted via `allowed_toolsets`).
+  - **Safe `file` + `skills` toolsets by default** (customizable via `allowed_toolsets`).
+  - **Vault path enforcement** blocks file reads/writes/searches outside the configured vault.
   - **Tool-level blocking** via `blocked_tools`.
   - **Preloadable skills** via `skills` (loaded via `skill_view` before curation).
-  - **Custom Model override** via `model` (or inherits the main chat model by default).
+  - **Custom model override** via `model_override` in config or `model` in the setup tool (otherwise inherits the main chat model).
 - **Configurable Hybrid Triggers:** Enable/disable turn triggers (`trigger_on_turns`) and tool-call triggers (`trigger_on_tools`) independently.
 - **Origin-Targeted Notifications:** Sends concise review summaries starting with `📝 Obsidian Review:` directly back to your active chat channel (Telegram, Discord, WhatsApp, etc.).
 
@@ -63,10 +64,10 @@ Or invoke the setup tool directly:
 | `curator_prompt` | string | *required* | Custom instructions telling the curator how to organize and curate your specific vault. |
 | `trigger_on_turns` | boolean | `true` | When `true`, completed conversation turns count towards `review_interval`. |
 | `trigger_on_tools` | boolean | `true` | When `true`, completed tool calls count towards `review_interval`. |
-| `allowed_toolsets` | array | `null` | Optional list of toolsets allowed for the curator (e.g. `["file", "skills"]`). Default `null` grants all native parent toolsets. |
+| `allowed_toolsets` | array | `["file", "skills"]` | Toolsets allowed for the curator. Add others only when your curator instructions require them. |
 | `blocked_tools` | array | `[]` | Optional list of specific tool names to block (e.g. `["terminal"]`). |
 | `skills` | array | `[]` | Optional list of skills to preload before curation (e.g. `["obsidian", "grounded-citations"]`). |
-| `model` | string | `null` | Optional custom model override for the curator subagent (e.g. `claude-3-5-sonnet-20241022`). Default inherits parent session. |
+| `model_override` | string | `null` | Optional custom model override in plugin config. The setup tool accepts this as its `model` argument. Default inherits parent session. |
 
 ---
 
