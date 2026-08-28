@@ -1,158 +1,87 @@
-# Obsidian Curator
+# Hermes Obsidian Curator
 
-> **Beginner-friendly Hermes Agent plugin** that turns a standard Hermes AI agent into a dedicated background Obsidian curator.
-
-The curator is not a separate engine or custom wrapper—it runs as a native Hermes agent with full tool access (`read_file`, `search_files`, `write_file`, `patch`, `session_search`). Its single purpose is keeping your Obsidian vault clean, organized, canonical, and link-accurate in the background.
-
----
+Native Hermes background review plugin dedicated to managing any Obsidian vault. It acts as an autonomous background curator that reviews your actual conversation history at configurable turn/tool intervals, audits canonical notes, and safely updates, merges, or creates notes without blind writes.
 
 ## Features
 
-- 🚀 **Beginner Friendly:** Clear 3-step setup for both humans and AI assistants.
-- 📂 **Initial Full-Vault Read:** Recursively maps and reads every Markdown file to EOF before making its very first write.
-- 🎯 **No Hardcoded Rules:** You and your AI agent write your own `curator_prompt` during setup to match your specific vault structure and methodology (e.g. PARA, Johnny Decimal, Atlas, or flat).
-- 🔀 **Flexible Hybrid Triggers:** Turn-based triggers and tool-based triggers can each be turned on or off independently.
-- 💬 **Origin Notifications:** Completed reviews automatically deliver a clean summary starting with `Obsidian:` back to the exact platform, chat, or thread where the activity happened (Telegram, Discord, WhatsApp, etc.).
-- 🛡️ **Anti-Loop:** The curator’s own activity does not increment trigger counters or spawn infinite background loops.
-- 🟢 **Deterministic No-Op:** If no updates or fixes are safely justified, your vault remains completely untouched.
+- **Global & Universal:** No hardcoded folder names or structures. Works on any Obsidian vault. On initial setup, recursively maps the vault structure to understand indexes, links, naming conventions, and governance notes.
+- **Accurate History Snapshots:** Captures exact recent conversation turns (`user` & `assistant` messages) so the curator evaluates authentic session facts.
+- **Flexible Capabilities (Cronjob-style):**
+  - **Full native tools by default** (or restricted via `allowed_toolsets`).
+  - **Tool-level blocking** via `blocked_tools`.
+  - **Preloadable skills** via `skills` (loaded via `skill_view` before curation).
+  - **Custom Model override** via `model` (or inherits the main chat model by default).
+- **Configurable Hybrid Triggers:** Enable/disable turn triggers (`trigger_on_turns`) and tool-call triggers (`trigger_on_tools`) independently.
+- **Origin-Targeted Notifications:** Sends concise review summaries starting with `📝 Obsidian Review:` directly back to your active chat channel (Telegram, Discord, WhatsApp, etc.).
 
 ---
 
-## 📖 Guide for Humans (Quick Start)
+## 3-Step Quick Start (Beginner Friendly)
 
-### Step 1: Install and Enable the Plugin
-
-Run this in your terminal:
-
+### 1. Install the Plugin
 ```bash
-hermes plugins install dhansxd/hermes-obsidian-curator --enable
+hermes plugins install https://github.com/dhansxd/hermes-obsidian-curator.git
 ```
 
-If you chat with Hermes over messaging platforms (like Telegram, Discord, or WhatsApp), enable the toolset for that platform (or omit `--platform` for CLI):
+### 2. Configure Your Vault & Preferences
+Run setup through Hermes CLI or tell your AI agent:
 
 ```bash
-hermes tools enable obsidian_curator --platform telegram
-# Repeat for other platforms if needed:
-# hermes tools enable obsidian_curator --platform discord
-# hermes tools enable obsidian_curator --platform whatsapp
+hermes config set plugins.entries.obsidian-curator.settings.vault_path "/Users/yourname/Documents/Obsidian Vault"
+hermes config set plugins.entries.obsidian-curator.settings.review_interval 20
+hermes config set plugins.entries.obsidian-curator.settings.trigger_on_turns true
+hermes config set plugins.entries.obsidian-curator.settings.trigger_on_tools true
 ```
 
-Verify installation:
-
+Set your vault-specific curation governance rules:
 ```bash
-hermes plugins doctor obsidian-curator
+hermes config set plugins.entries.obsidian-curator.settings.curator_prompt "Review recent chat history for decisions, project status changes, and durable knowledge. Read existing canonical notes first. Follow governance rules in index notes."
 ```
 
-Expected result: plugin version appears with `OK`, `1 tool(s)`, and `5 hook(s)`.
+### 3. Run Initial Setup
+Inside your Hermes chat session, tell Hermes:
+> *"Tolong jalankan setup obsidian curator untuk vault-ku."*
 
-### Step 2: Restart Your Hermes Gateway
-
-For the new plugin code and hooks to be loaded into memory, restart Hermes:
-
-```bash
-# If running as a background service:
-hermes gateway restart
-
-# Or if running interactive chat / CLI:
-# simply exit and start Hermes again.
-```
-
-### Step 3: Back Up Your Vault, Then Ask Hermes to Set It Up
-
-Because the curator can edit, move, archive, and delete notes when your rules allow it, make a backup or Git snapshot before first setup.
-
-Then paste this into your chat with Hermes:
-
-> *"Please set up Obsidian Curator for my vault at `/Users/yourname/Documents/MyVault`. First inspect my vault's entry note and structure. Help me draft a custom curator prompt and choose a trigger mode. Show me the final vault path, prompt, review interval, and trigger settings for confirmation before calling setup."*
-
-After you approve the settings, Hermes calls the setup tool. Initial mapping runs in the background, and Hermes sends an `Obsidian:` notification when finished.
-
----
-
-## 🤖 Guide for AI Assistants (Agent Instructions)
-
-When a user asks you to configure or maintain Obsidian Curator, follow this exact workflow:
-
-### 1. Inspect the User's Vault First
-Before calling `setup`, use `read_file` or `search_files` to discover:
-- The main entry note (e.g. `Home.md`, `README.md`, `INDEX.md`, or root folder structure).
-- Any existing vault rules, folders (e.g., `01 Capture`, `Projects`, `Areas`, `System`), or tag taxonomy.
-
-### 2. Formulate a Strong `curator_prompt`
-Compose a clear, concise instruction block (maximum 12,000 characters). Include:
-- Which files/notes are authoritative governance (if any).
-- Instructions to perform full canonical checking, duplicate detection, link verification, and folder placement.
-- Rules to treat ongoing chat transcripts as **candidate evidence only** (never copy transcripts blindly).
-- Instruction to preserve provenance and make zero unneeded changes (no-op when clean).
-
-### 3. Call the `obsidian_curator` Setup Tool
-Invoke the tool with:
-
+Or invoke the setup tool directly:
 ```json
 {
   "operation": "setup",
-  "vault_path": "/absolute/path/to/vault",
+  "vault_path": "/Users/yourname/Documents/Obsidian Vault",
   "review_interval": 20,
-  "curator_prompt": "Your formulated curation prompt here...",
-  "trigger_on_turns": true,
-  "trigger_on_tools": true
+  "curator_prompt": "Audit recent chat history and update canonical notes."
 }
 ```
 
-*The tool immediately dispatches the native agent to run the initial recursive mapping and full vault read in the background.*
+---
+
+## Configuration Reference
+
+| Setting | Type | Default | Description |
+|---|---|---|---|
+| `vault_path` | string | *required* | Absolute path to your Obsidian vault directory. |
+| `review_interval` | integer | `20` | Number of events (turns or tool calls) before running a review. |
+| `curator_prompt` | string | *required* | Custom instructions telling the curator how to organize and curate your specific vault. |
+| `trigger_on_turns` | boolean | `true` | When `true`, completed conversation turns count towards `review_interval`. |
+| `trigger_on_tools` | boolean | `true` | When `true`, completed tool calls count towards `review_interval`. |
+| `allowed_toolsets` | array | `null` | Optional list of toolsets allowed for the curator (e.g. `["file", "skills"]`). Default `null` grants all native parent toolsets. |
+| `blocked_tools` | array | `[]` | Optional list of specific tool names to block (e.g. `["terminal"]`). |
+| `skills` | array | `[]` | Optional list of skills to preload before curation (e.g. `["obsidian", "grounded-citations"]`). |
+| `model` | string | `null` | Optional custom model override for the curator subagent (e.g. `claude-3-5-sonnet-20241022`). Default inherits parent session. |
 
 ---
 
-## ⚙️ Trigger Configuration
+## Instructions for AI Agents Setting Up This Plugin
 
-You can customize which events count toward the periodic background review interval:
+When a user asks you to configure or maintain Obsidian Curator:
 
-| Mode | `trigger_on_turns` | `trigger_on_tools` | Description |
-|---|:---:|:---:|---|
-| **Hybrid (Default)** | `true` | `true` | Both completed turns and tool calls increment the review counter. |
-| **Turns Only** | `true` | `false` | Only completed conversation turns trigger background review. |
-| **Tools Only** | `false` | `true` | Only completed tool executions trigger background review. |
-| **Periodic Off** | `false` | `false` | Periodic background reviews disabled. Initial & manual setup still works. |
-
-### Adjusting Triggers On The Fly
-
-You can switch modes anytime without rerunning initial vault mapping:
-
-```bash
-# Example: switch to turns only
-hermes config set plugins.entries.obsidian-curator.settings.trigger_on_turns true
-hermes config set plugins.entries.obsidian-curator.settings.trigger_on_tools false
-
-# Example: change the interval
-hermes config set plugins.entries.obsidian-curator.settings.review_interval 30
-```
-
----
-
-## 🔍 How It Works
-
-1. **Initial Setup Run:**
-   The agent recursively reads all readable Markdown notes in the vault to build internal context before any write or modification happens.
-2. **Background Counting:**
-   As you talk to Hermes or as tools execute, the plugin increments a lightweight activity counter based on your active trigger settings.
-3. **Periodic Autonomous Review:**
-   When `review_interval` is reached, Hermes launches a background subagent (`role="orchestrator"`). The curator audits changes, canonical notes, duplicates, and orphans.
-4. **Origin Notification:**
-   Once finished, the curator sends a message starting with `Obsidian: ...` directly to the chat where the trigger occurred.
-
----
-
-## ❓ FAQ & Troubleshooting
-
-- **Do I need to restart the gateway after changing `review_interval` or triggers via `hermes config set`?**
-  No, configuration values are read dynamically on every trigger check.
-- **Why hasn't the curator sent any message?**
-  If no changes or fixes were needed, the curator performs a silent or concise no-op. Also check if `review_interval` has been reached.
-- **Can I manage multiple vaults?**
-  Each Hermes profile manages one active vault path. Use Hermes profiles (`hermes --profile work`) to manage separate vaults.
-
----
-
-## 📄 License
-
-MIT License. Built with ❤️ for the Hermes Agent ecosystem.
+1. **Verify Vault Path:** Always check that `vault_path` exists on disk using file tools before running setup.
+2. **Review User Prompts:** Never hardcode vault paths or private file names inside repository code. Put user-specific guidelines into `curator_prompt`.
+3. **Trigger Modes:**
+   - **Hybrid (Recommended):** `trigger_on_turns: true`, `trigger_on_tools: true`.
+   - **Turns Only:** `trigger_on_turns: true`, `trigger_on_tools: false`.
+   - **Tools Only:** `trigger_on_turns: false`, `trigger_on_tools: true`.
+   - **Manual Only:** Both `false` (setup still runs initial mapping, but background reviews stay quiet).
+4. **Safety & Non-Destructive Operation:**
+   - The curator agent runs with non-authoritative candidate evidence rules.
+   - It must read existing notes before patching or writing new files.
+   - All review outcomes report with `📝 Obsidian Review: <concise summary>`.

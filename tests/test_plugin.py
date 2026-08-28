@@ -86,10 +86,10 @@ def test_setup_launches_native_agent_with_recursive_mapping_prompt(tmp_path, mon
     assert len(ctx.subagent_lifecycle.requests) == 1
     req = ctx.subagent_lifecycle.requests[0]
     assert req.role == "orchestrator"
-    assert "map the entire vault recursively" in req.goal
+    assert "Map the entire vault recursively" in req.goal
     assert "search_files with pagination" in req.goal
-    assert "Read every readable vault file completely with read_file" in req.goal
-    assert "Do not write or patch anything until this full-vault mapping is complete." in req.goal
+    assert "Read every readable markdown file completely with read_file" in req.goal
+    assert "Do not write or patch anything until full-vault mapping is complete." in req.goal
 
 
 def test_setup_stores_and_uses_user_defined_curator_prompt(tmp_path, monkeypatch):
@@ -364,7 +364,7 @@ def test_subagent_stop_delivers_notification_to_origin_platform_target(monkeypat
         {
             "action": "send",
             "target": "telegram:8804634959",
-            "message": "Obsidian: updated coastal restoration note.",
+            "message": "📝 Obsidian Review: updated coastal restoration note.",
         }
     ]
 
@@ -386,7 +386,7 @@ def test_subagent_stop_falls_back_to_callback_if_origin_send_fails(monkeypatch):
         child_status="completed",
     )
 
-    assert notices == ["Obsidian: review complete."]
+    assert notices == ["📝 Obsidian Review: review complete."]
 
 
 def test_setup_quotes_arbitrary_vault_path_in_prompt(tmp_path, monkeypatch):
@@ -423,7 +423,7 @@ def test_context_stays_under_native_lifecycle_limit_and_keeps_latest_turn():
     assert context is not None
     assert len(context) <= 32000
     assert "latest durable fact" in context
-    assert "prior history truncated" in context
+    assert "[... truncated ...]" in context
 
 
 def test_setup_rejects_non_directory():
@@ -624,6 +624,267 @@ def test_setup_accepts_and_stores_custom_trigger_switches(tmp_path, monkeypatch)
     assert result["ok"] is True
     assert ctx.config["trigger_on_turns"] is False
     assert ctx.config["trigger_on_tools"] is True
+
+
+def test_session_history_cache_captures_exact_recent_messages_for_interval(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(plugin, "_resolve_origin_target", lambda session_id, platform="": None)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 3,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    # Turn 1
+    ctx.hooks["pre_llm_call"](
+        session_id="sess-prod",
+        user_message="Turn 1: Decision on architecture.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="sess-prod",
+        user_message="Turn 1: Decision on architecture.",
+        assistant_response="Turn 1 ack.",
+        conversation_history=[{"role": "user", "content": "Turn 1: Decision on architecture."}],
+        platform="telegram",
+    )
+
+    # Turn 2
+    ctx.hooks["pre_llm_call"](
+        session_id="sess-prod",
+        user_message="Turn 2: Research findings.",
+        conversation_history=[
+            {"role": "user", "content": "Turn 1: Decision on architecture."},
+            {"role": "assistant", "content": "Turn 1 ack."},
+        ],
+        platform="telegram",
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="sess-prod",
+        user_message="Turn 2: Research findings.",
+        assistant_response="Turn 2 ack.",
+        conversation_history=[
+            {"role": "user", "content": "Turn 1: Decision on architecture."},
+            {"role": "assistant", "content": "Turn 1 ack."},
+            {"role": "user", "content": "Turn 2: Research findings."},
+        ],
+        platform="telegram",
+    )
+
+    # Turn 3 -> triggers review
+    ctx.hooks["pre_llm_call"](
+        session_id="sess-prod",
+        user_message="Turn 3: Project state changed to active.",
+        conversation_history=[
+            {"role": "user", "content": "Turn 1: Decision on architecture."},
+            {"role": "assistant", "content": "Turn 1 ack."},
+            {"role": "user", "content": "Turn 2: Research findings."},
+            {"role": "assistant", "content": "Turn 2 ack."},
+        ],
+        platform="telegram",
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="sess-prod",
+        user_message="Turn 3: Project state changed to active.",
+        assistant_response="Turn 3 ack.",
+        conversation_history=[],  # Simulating gateway where post_llm_call might have empty/missing conversation_history
+        platform="telegram",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    req = ctx.subagent_lifecycle.requests[0]
+    assert req.context is not None
+    assert "Turn 1: Decision on architecture." in req.context
+    assert "Turn 1 ack." in req.context
+    assert "Turn 2: Research findings." in req.context
+    assert "Turn 2 ack." in req.context
+    assert "Turn 3: Project state changed to active." in req.context
+    assert "Turn 3 ack." in req.context
+    assert req.context.count("\nuser:") + req.context.startswith("user:") == 3
+    assert req.context.count("\nassistant:") == 3
+
+
+def test_initial_mapping_prompt_is_universal_without_hardcoded_file_names(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    goal = plugin._prompt(
+        tmp_path,
+        "sess-1",
+        "Curate vault according to user instructions.",
+        initial_setup=True,
+    )
+    assert "HERMES.md" not in goal
+    assert "Home.md" not in goal
+    assert "99 System" not in goal
+    assert "map the entire vault recursively" in goal.lower()
+    assert "📝 Obsidian Review:" in goal
+
+
+def test_subagent_stop_normalizes_report_prefix_to_note_emoji(monkeypatch):
+    plugin = load_plugin()
+    ctx = Context()
+    sent_messages = []
+    monkeypatch.setattr(
+        plugin,
+        "_send_message_tool",
+        lambda args: sent_messages.append(args) or json.dumps({"success": True}),
+    )
+    plugin.register(ctx)
+
+    setattr(plugin, "_ACTIVE_CHILD", "child-rep-1")
+    plugin._ORIGIN_TARGETS["child-rep-1"] = "telegram:8804634959"
+
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-rep-1",
+        child_summary="Obsidian: updated project status note.",
+        child_status="completed",
+    )
+
+    assert sent_messages == [
+        {
+            "action": "send",
+            "target": "telegram:8804634959",
+            "message": "📝 Obsidian Review: updated project status note.",
+        }
+    ]
+
+
+def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context()
+    plugin.register(ctx)
+
+    result = json.loads(
+        ctx.tools["obsidian_curator"](
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 10,
+                "curator_prompt": "Audit vault.",
+                "allowed_toolsets": ["file", "skills"],
+                "blocked_tools": ["terminal"],
+                "skills": ["obsidian", "grounded-citations"],
+                "model": "claude-3-5-sonnet-20241022",
+            }
+        )
+    )
+
+    assert result["ok"] is True
+    assert ctx.config["allowed_toolsets"] == ["file", "skills"]
+    assert ctx.config["blocked_tools"] == ["terminal"]
+    assert ctx.config["skills"] == ["obsidian", "grounded-citations"]
+    assert ctx.config["model"] == "claude-3-5-sonnet-20241022"
+
+    req = ctx.subagent_lifecycle.requests[0]
+    assert req.allowed_toolsets == ("file", "skills")
+    assert not hasattr(req, "blocked_tools")
+    assert req.model == "claude-3-5-sonnet-20241022"
+    assert "skill_view" in req.goal
+    assert "obsidian" in req.goal
+    assert "grounded-citations" in req.goal
+
+    setattr(plugin, "_ACTIVE_CHILD", "child-tools-1")
+    assert ctx.hooks["pre_tool_call"](
+        session_id="child-tools-1", tool_name="terminal", args={}
+    ) == {
+        "action": "block",
+        "message": "Tool 'terminal' is disabled for the Obsidian curator subagent.",
+    }
+    assert (
+        ctx.hooks["pre_tool_call"](
+            session_id="child-tools-1", tool_name="read_file", args={}
+        )
+        is None
+    )
+
+
+def test_session_history_cache_does_not_duplicate_full_history(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 10,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    first = [
+        {"role": "user", "content": "User one"},
+        {"role": "assistant", "content": "Assistant one"},
+    ]
+    ctx.hooks["pre_llm_call"](
+        session_id="sess-cache",
+        user_message="User two",
+        conversation_history=first,
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="sess-cache",
+        assistant_response="Assistant two",
+        conversation_history=first + [{"role": "user", "content": "User two"}],
+    )
+
+    assert plugin._SESSION_HISTORIES["sess-cache"] == [
+        {"role": "user", "content": "User one"},
+        {"role": "assistant", "content": "Assistant one"},
+        {"role": "user", "content": "User two"},
+        {"role": "assistant", "content": "Assistant two"},
+    ]
+
+
+def test_tool_trigger_uses_latest_chat_cache_not_tool_payload(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(plugin, "_resolve_origin_target", lambda session_id, platform="": None)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit vault.",
+            "trigger_on_turns": False,
+            "trigger_on_tools": True,
+        }
+    )
+    plugin.register(ctx)
+    ctx.hooks["pre_llm_call"](
+        session_id="sess-tool-cache",
+        user_message="Durable project decision",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="sess-tool-cache",
+        assistant_response="Decision acknowledged",
+        conversation_history=[
+            {"role": "user", "content": "Durable project decision"}
+        ],
+    )
+
+    ctx.hooks["post_tool_call"](
+        session_id="sess-tool-cache",
+        tool_name="terminal",
+        args={"command": "UNTRUSTED_TOOL_PAYLOAD_1"},
+        result="UNTRUSTED_TOOL_RESULT_1",
+    )
+    ctx.hooks["post_tool_call"](
+        session_id="sess-tool-cache",
+        tool_name="terminal",
+        args={"command": "UNTRUSTED_TOOL_PAYLOAD_2"},
+        result="UNTRUSTED_TOOL_RESULT_2",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    req = ctx.subagent_lifecycle.requests[0]
+    assert "Durable project decision" in req.context
+    assert "Decision acknowledged" in req.context
+    assert "UNTRUSTED_TOOL_PAYLOAD_1" not in req.context
+    assert "UNTRUSTED_TOOL_RESULT_1" not in req.context
+    assert "UNTRUSTED_TOOL_PAYLOAD_2" not in req.context
+    assert "UNTRUSTED_TOOL_RESULT_2" not in req.context
 
 
 def test_manifest_is_valid():
