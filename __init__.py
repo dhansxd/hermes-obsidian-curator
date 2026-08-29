@@ -28,7 +28,7 @@ _CTX = None
 _parent_review_callback: Callable[[str], Any] | None = None
 _MESSAGE_CHAR_CAP = 12_000
 _DEFAULT_TOOLSETS = ("file", "skills")
-_ALWAYS_BLOCKED_TOOLS = ("skill_manage",)
+_ALWAYS_BLOCKED_TOOLS = ("delegate_task", "skill_manage")
 _DEFAULT_RETRY_SECONDS = 5 * 60 * 60
 _PENDING_HISTORY_CHAR_CAP = 28_000
 

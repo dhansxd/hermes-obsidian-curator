@@ -9,7 +9,7 @@ Native Hermes background review plugin dedicated to managing any Obsidian vault.
 - **Flexible Capabilities (Cronjob-style):**
   - **Safe `file` + `skills` toolsets by default** (customizable via `allowed_toolsets`).
   - **Vault path enforcement** blocks file reads/writes/searches outside the configured vault.
-  - **Tool-level blocking** via `blocked_tools`.
+  - **Tool-level blocking** via `blocked_tools` (and `delegate_task` is always blocked for the curator child while parent delegation remains unaffected).
   - **Preloadable skills** via `skills` (loaded via `skill_view` before curation).
   - **Custom model override** via `model_override` in config or `model` in the setup tool (otherwise inherits the main chat model).
 - **Configurable Hybrid Triggers:** Enable/disable turn triggers (`trigger_on_turns`) and tool-call triggers (`trigger_on_tools`) independently. Tool calls only count activity; automatic reviews wait for successful `post_llm_call`, after main agent finishes its full tool loop and final response.

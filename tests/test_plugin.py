@@ -1339,6 +1339,26 @@ def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
     assert "grounded-citations" in req.goal
 
     setattr(plugin, "_ACTIVE_CHILD", "child-tools-1")
+
+    delegation_block = ctx.hooks["pre_tool_call"](
+        session_id="child-tools-1",
+        tool_name="delegate_task",
+        args={"tasks": [{"goal": "spawn nested curator"}]},
+    )
+    assert delegation_block == {
+        "action": "block",
+        "message": "Tool 'delegate_task' is disabled for the Obsidian curator subagent.",
+    }
+
+    # Same tool remains available outside the curator child.
+    assert (
+        ctx.hooks["pre_tool_call"](
+            session_id="parent-session",
+            tool_name="delegate_task",
+            args={"tasks": [{"goal": "normal parent delegation"}]},
+        )
+        is None
+    )
     assert ctx.hooks["pre_tool_call"](
         session_id="child-tools-1", tool_name="terminal", args={}
     ) == {
