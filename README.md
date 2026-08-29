@@ -17,6 +17,8 @@ Native Hermes background review plugin dedicated to managing any Obsidian vault.
   - With inherited parent model (`model_override: null`), next successful parent turn retries after model switch or same-model recovery.
   - With dedicated `model_override`, parent success alone does not retry; changing override or reaching provider reset time makes retry eligible at next completed parent-turn boundary.
   - No implicit fallback model.
+- **Failure-Safe Review Lifecycle:** Permanent review failures honor durable backoff without discarding unreviewed activity; transient provider limits retain bounded context for retry. Stop-hook counter/state updates run atomically under the plugin lock.
+- **Resilient Notifications:** Transport exceptions fall back to the parent callback without corrupting curator state or crashing the lifecycle hook.
 - **Origin-Targeted Notifications:** Sends concise review summaries starting with `📝 Obsidian Review:` directly back to your active chat channel (Telegram, Discord, WhatsApp, etc.).
 
 ---

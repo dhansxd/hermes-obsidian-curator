@@ -487,6 +487,40 @@ def test_inherited_model_retries_after_successful_same_model_turn(
     assert len(ctx.subagent_lifecycle.requests) == 1
 
 
+def test_repeated_inherited_429_waits_for_backoff_after_one_health_probe(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    pending = _pending_retry_state(retry_at=2_000.0)
+    pending["attempts"] = 2
+    ctx.state.set("activity_count", 2)
+    ctx.state.set("pending_review", pending)
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="parent-turn-after-second-429",
+        model="parent/model",
+        assistant_response="Parent succeeded, but curator already failed twice.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert not ctx.subagent_lifecycle.requests
+    assert ctx.state.get("pending_review")["status"] == "retry_wait"
+
+
 def test_inherited_model_retries_after_successful_parent_model_change(
     tmp_path, monkeypatch
 ):
@@ -627,6 +661,42 @@ def test_dedicated_model_retries_after_retry_time(tmp_path, monkeypatch):
     assert ctx.subagent_lifecycle.requests[0].model == "dedicated/model"
 
 
+def test_failed_pending_review_from_older_version_is_restored_after_restart(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    pending = _pending_retry_state()
+    pending["status"] = "failed"
+    ctx.state.set("pending_review", pending)
+
+    plugin.register(ctx)
+
+    restored = ctx.state.get("pending_review")
+    assert restored is not None
+    assert restored["status"] == "pending"
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="first-turn-after-upgrade",
+        model="parent/model",
+        assistant_response="Main agent finished after upgrade.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    assert len(ctx.subagent_lifecycle.requests) == 1
+
+
 def test_running_pending_review_is_restored_after_plugin_restart(
     tmp_path, monkeypatch
 ):
@@ -748,6 +818,59 @@ def test_dedicated_model_ignores_parent_success_before_retry_time(
     pending_state = ctx.state.get("pending_review")
     assert pending_state is not None
     assert pending_state["status"] == "retry_wait"
+
+
+def test_permanent_failure_preserves_review_and_waits_for_backoff(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="turn-1",
+        model="parent/model",
+        assistant_response="First boundary.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    first_request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](
+        child_session_id="curator-child-1", child_goal=first_request.goal
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="curator-child-1",
+        child_summary="Invalid request: curator prompt rejected.",
+        child_status="failed",
+    )
+
+    pending = ctx.state.get("pending_review")
+    assert pending is not None
+    assert pending["status"] == "retry_wait"
+    assert pending["retry_kind"] == "failure"
+    assert pending["next_retry_at"] > 1_000.0
+    assert ctx.state.get("activity_count") == 1
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="turn-2",
+        model="different/model",
+        assistant_response="Second boundary.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    assert len(ctx.subagent_lifecycle.requests) == 1
 
 
 def test_activity_counter_resets_at_successful_launch_and_preserves_new_events(
@@ -914,6 +1037,92 @@ def test_subagent_stop_falls_back_to_callback_if_origin_send_fails(monkeypatch):
     )
 
     assert notices == ["📝 Obsidian Review: review complete."]
+
+
+def test_subagent_stop_does_not_crash_if_send_tool_throws_exception(monkeypatch):
+    plugin = load_plugin()
+    ctx = Context()
+    notices = []
+
+    def exploding_send(args):
+        raise RuntimeError("Gateway transport down")
+
+    monkeypatch.setattr(plugin, "_send_message_tool", exploding_send)
+    monkeypatch.setattr(plugin, "_parent_review_callback", notices.append)
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "child-exploding-send")
+    plugin._ORIGIN_TARGETS["child-exploding-send"] = "telegram:8804634959"
+
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-exploding-send",
+        child_summary="Obsidian: review complete.",
+        child_status="completed",
+    )
+
+    assert notices == ["📝 Obsidian Review: review complete."]
+
+
+def test_subagent_stop_updates_lifecycle_state_under_lock():
+    plugin = load_plugin()
+
+    class LockCheckingState(State):
+        check_lock = False
+
+        def _assert_lock(self, key):
+            if self.check_lock and key in ("activity_count", "pending_review"):
+                assert plugin._LOCK._is_owned()
+
+        def get(self, key, default=None):
+            self._assert_lock(key)
+            return super().get(key, default)
+
+        def set(self, key, value):
+            self._assert_lock(key)
+            super().set(key, value)
+
+    ctx = Context()
+    ctx.state = LockCheckingState()
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "child-lock")
+    ctx.state.set("activity_count", 5)
+    ctx.state.set(
+        "pending_review",
+        {
+            "review_id": "r-lock",
+            "reviewed_activity_count": 3,
+            "history_snapshot": [],
+            "status": "pending",
+        },
+    )
+    ctx.state.check_lock = True
+
+    class TrackingLock:
+        def __init__(self, inner):
+            self.inner = inner
+            self.enter_count = 0
+
+        def __enter__(self):
+            self.enter_count += 1
+            return self.inner.__enter__()
+
+        def __exit__(self, *args):
+            return self.inner.__exit__(*args)
+
+        def _is_owned(self):
+            return self.inner._is_owned()
+
+    tracking_lock = TrackingLock(plugin._LOCK)
+    setattr(plugin, "_LOCK", tracking_lock)
+    plugin._on_subagent_stop(
+        child_session_id="child-lock",
+        child_status="completed",
+        child_summary="📝 Obsidian Review: complete.",
+    )
+
+    ctx.state.check_lock = False
+    assert tracking_lock.enter_count == 1
+    assert ctx.state.get("activity_count") == 2
+    assert ctx.state.get("pending_review") is None
 
 
 def test_setup_quotes_arbitrary_vault_path_in_prompt(tmp_path, monkeypatch):
@@ -1550,6 +1759,74 @@ def test_pre_tool_call_blocks_file_operations_outside_vault(tmp_path):
     assert blocked_patch is not None
     assert blocked_patch["action"] == "block"
 
+    # Hermes splits a missing search path on commas/whitespace and searches
+    # every existing segment. Composite paths must not bypass vault checks.
+    composite_path = f"{vault / 'missing'},{outside}"
+    blocked_multi_search = ctx.hooks["pre_tool_call"](
+        session_id="child-safe-1",
+        tool_name="search_files",
+        args={"pattern": "*.md", "target": "files", "path": composite_path},
+    )
+    assert blocked_multi_search is not None
+    assert blocked_multi_search["action"] == "block"
+
+    spaced_directory = vault / "folder with spaces"
+    spaced_directory.mkdir()
+    assert (
+        ctx.hooks["pre_tool_call"](
+            session_id="child-safe-1",
+            tool_name="search_files",
+            args={"pattern": "*.md", "target": "files", "path": str(spaced_directory)},
+        )
+        is None
+    )
+
+
+def test_pre_tool_call_fails_closed_for_invalid_policy_config(tmp_path):
+    plugin = load_plugin()
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+            "blocked_tools": 7,
+        }
+    )
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "child-invalid-policy")
+
+    result = ctx.hooks["pre_tool_call"](
+        session_id="child-invalid-policy",
+        tool_name="delegate_task",
+        args={"tasks": []},
+    )
+
+    assert result is not None
+    assert result["action"] == "block"
+
+
+def test_pre_tool_call_blocks_file_tools_if_vault_becomes_unavailable(tmp_path):
+    plugin = load_plugin()
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "child-missing-vault")
+    ctx.config["vault_path"] = ""
+
+    result = ctx.hooks["pre_tool_call"](
+        session_id="child-missing-vault",
+        tool_name="read_file",
+        args={"path": str(tmp_path / "note.md")},
+    )
+
+    assert result is not None
+    assert result["action"] == "block"
+
 
 def test_session_history_cache_evicts_oldest_sessions(monkeypatch):
     plugin = load_plugin()
@@ -1564,7 +1841,7 @@ def test_session_history_cache_evicts_oldest_sessions(monkeypatch):
             conversation_history=[],
         )
 
-    assert len(plugin._SESSION_HISTORIES) <= 64
+    assert len(plugin._SESSION_HISTORIES) <= 32
     assert "sess-0" not in plugin._SESSION_HISTORIES
     assert "sess-119" in plugin._SESSION_HISTORIES
 

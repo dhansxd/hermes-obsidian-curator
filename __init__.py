@@ -18,15 +18,15 @@ _LOCK = threading.RLock()
 _NOTIFIERS: dict[str, Callable[[str], Any]] = {}
 _ORIGIN_TARGETS: dict[str, str] = {}
 _SESSION_HISTORIES: dict[str, list[dict[str, Any]]] = {}
-_MAX_SESSION_ENTRIES = 64
-_MAX_SESSION_MESSAGES = 100
+_MAX_SESSION_ENTRIES = 32
+_MAX_SESSION_MESSAGES = 40
+_MESSAGE_CHAR_CAP = 6_000
 _LAUNCHING = False
 _ACTIVE_CHILD: str | None = None
 _PENDING_NOTIFIER: Callable[[str], Any] | None = None
 _PENDING_ORIGIN_TARGET: str | None = None
 _CTX = None
 _parent_review_callback: Callable[[str], Any] | None = None
-_MESSAGE_CHAR_CAP = 12_000
 _DEFAULT_TOOLSETS = ("file", "skills")
 _ALWAYS_BLOCKED_TOOLS = ("delegate_task", "skill_manage")
 _DEFAULT_RETRY_SECONDS = 5 * 60 * 60
@@ -432,6 +432,13 @@ def _on_pre_llm_call(**event: Any) -> None:
 def _on_subagent_stop(**event: Any) -> None:
     global _ACTIVE_CHILD
     child_session_id = str(event.get("child_session_id") or "")
+    child_status = str(event.get("child_status") or "failed")
+    raw_summary = str(event.get("child_summary") or "").strip()
+    normalized_error = " ".join(raw_summary.split())
+    transient = child_status != "completed" and _is_transient_limit_error(
+        normalized_error
+    )
+
     with _LOCK:
         ctx = _CTX
         if ctx is None or child_session_id != _ACTIVE_CHILD:
@@ -441,33 +448,30 @@ def _on_subagent_stop(**event: Any) -> None:
         callback = _NOTIFIERS.pop(child_session_id, None) or _parent_review_callback
         pending_raw = ctx.state.get("pending_review")
         pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
-    child_status = str(event.get("child_status") or "failed")
-    raw_summary = str(event.get("child_summary") or "").strip()
-    normalized_error = " ".join(raw_summary.split())
-    transient = child_status != "completed" and _is_transient_limit_error(
-        normalized_error
-    )
 
-    if child_status == "completed":
-        reviewed_count = int(pending.get("reviewed_activity_count", 0) or 0)
-        current_count = int(ctx.state.get("activity_count", 0) or 0)
-        ctx.state.set("activity_count", max(0, current_count - reviewed_count))
-        ctx.state.set("pending_review", None)
-    elif pending:
-        pending["status"] = "retry_wait" if transient else "failed"
-        pending["attempts"] = int(pending.get("attempts", 0) or 0) + 1
-        pending["last_error"] = normalized_error[:2000]
-        pending["origin_target"] = origin_target or pending.get("origin_target")
-        if transient:
+        if child_status == "completed":
+            reviewed_count = int(pending.get("reviewed_activity_count", 0) or 0)
+            current_count = int(ctx.state.get("activity_count", 0) or 0)
+            ctx.state.set("activity_count", max(0, current_count - reviewed_count))
+            ctx.state.set("pending_review", None)
+        elif pending:
+            pending["status"] = "retry_wait"
+            pending["retry_kind"] = "transient" if transient else "failure"
+            pending["attempts"] = int(pending.get("attempts", 0) or 0) + 1
+            pending["last_error"] = normalized_error[:2000]
+            pending["origin_target"] = origin_target or pending.get("origin_target")
             pending["failed_model"] = (
                 _model_from_error(normalized_error)
                 or str(pending.get("model_override_at_launch") or "")
                 or str(pending.get("parent_model_at_launch") or "")
             )
-            pending["next_retry_at"] = time.time() + _retry_delay_seconds(
-                normalized_error
+            delay = (
+                _retry_delay_seconds(normalized_error)
+                if transient
+                else _DEFAULT_RETRY_SECONDS
             )
-        ctx.state.set("pending_review", pending)
+            pending["next_retry_at"] = time.time() + delay
+            ctx.state.set("pending_review", pending)
 
     summary = normalized_error
     if transient:
@@ -485,15 +489,18 @@ def _on_subagent_stop(**event: Any) -> None:
         summary = f"📝 Obsidian Review: {summary}"
     delivered = False
     if origin_target:
-        raw = _send_message_tool(
-            {"action": "send", "target": origin_target, "message": summary}
-        )
         try:
+            raw = _send_message_tool(
+                {"action": "send", "target": origin_target, "message": summary}
+            )
             delivered = bool(json.loads(raw).get("success"))
-        except (TypeError, ValueError):
+        except Exception:
             delivered = False
     if not delivered and callback:
-        callback(summary)
+        try:
+            callback(summary)
+        except Exception:
+            pass
 
 
 def _review_interval(ctx: Any) -> int | None:
@@ -571,12 +578,21 @@ def _should_trigger_pending_retry(
             return True
         return False
 
-    # Inherited model mode:
-    # Sub-case A1: user switched parent model
+    # Inherited model mode: permanent failures always honor durable backoff.
+    retry_kind = str(pending.get("retry_kind") or "transient")
+    if retry_kind == "failure":
+        return bool(retry_after and now >= retry_after)
+    # Sub-case A1: user switched parent model after a transient failure.
     if current_parent_model and failed_model and current_parent_model != failed_model:
         return True
-    # Sub-case A2: parent turn succeeded on same model (live health recovery proof)
-    if current_parent_model and failed_model and current_parent_model == failed_model:
+    # Sub-case A2: one same-model health probe for a first transient limit only.
+    attempts = int(pending.get("attempts", 0) or 0)
+    if (
+        current_parent_model
+        and failed_model
+        and current_parent_model == failed_model
+        and attempts <= 1
+    ):
         return True
     # Sub-case A3: reset timer elapsed
     if retry_after and now >= retry_after:
@@ -674,57 +690,78 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
     with _LOCK:
         if not session_id or session_id != _ACTIVE_CHILD:
             return None
-        settings = _settings(ctx)
-        blocked = _ALWAYS_BLOCKED_TOOLS + tuple(
-            str(t) for t in (settings.get("blocked_tools") or [])
-        )
-        if tool_name and tool_name in blocked:
-            return {
-                "action": "block",
-                "message": f"Tool '{tool_name}' is disabled for the Obsidian curator subagent.",
-            }
-        vault_raw = str(settings.get("vault_path") or "").strip()
-        if vault_raw and tool_name in (
-            "read_file",
-            "write_file",
-            "patch",
-            "search_files",
-        ):
-            vault_root = Path(vault_raw).expanduser().resolve()
-            args = event.get("args") or {}
-            if tool_name == "search_files" and not args.get("path"):
+        try:
+            settings = _settings(ctx)
+            raw_blocked = settings.get("blocked_tools") or []
+            if not isinstance(raw_blocked, (list, tuple, set)):
+                raw_blocked = [raw_blocked]
+            blocked = _ALWAYS_BLOCKED_TOOLS + tuple(str(t) for t in raw_blocked)
+            if tool_name and tool_name in blocked:
                 return {
                     "action": "block",
-                    "message": "Tool 'search_files' requires an explicit path inside the designated Obsidian vault.",
+                    "message": f"Tool '{tool_name}' is disabled for the Obsidian curator subagent.",
                 }
-            target_paths: list[str] = []
-            if isinstance(args.get("path"), str) and args.get("path"):
-                target_paths.append(str(args["path"]))
-            if tool_name == "patch" and str(args.get("mode") or "replace") == "patch":
-                import re
-
-                for m in re.finditer(
-                    r"^\*\*\*\s*(Update|Add|Delete|Move)\s+File:\s*(.+)$",
-                    str(args.get("patch") or ""),
-                    re.MULTILINE,
-                ):
-                    header_target = m.group(2).strip()
-                    if "->" in header_target:
-                        for segment in header_target.split("->"):
-                            if segment.strip():
-                                target_paths.append(segment.strip())
-                    elif header_target:
-                        target_paths.append(header_target)
-            for raw_target in target_paths:
-                try:
-                    target_resolved = Path(raw_target).expanduser().resolve()
-                    # Must be within vault root or match vault root exactly
-                    target_resolved.relative_to(vault_root)
-                except Exception:
+            vault_raw = str(settings.get("vault_path") or "").strip()
+            if tool_name in ("read_file", "write_file", "patch", "search_files"):
+                if not vault_raw:
                     return {
                         "action": "block",
-                        "message": f"Path '{raw_target}' is outside the designated Obsidian vault.",
+                        "message": "Obsidian vault path is unconfigured or unavailable.",
                     }
+                vault_root = Path(vault_raw).expanduser().resolve()
+                args = event.get("args") or {}
+                if tool_name == "search_files" and not args.get("path"):
+                    return {
+                        "action": "block",
+                        "message": "Tool 'search_files' requires an explicit path inside the designated Obsidian vault.",
+                    }
+                target_paths: list[str] = []
+                if isinstance(args.get("path"), str) and args.get("path"):
+                    raw_path_arg = str(args["path"])
+                    if tool_name == "search_files":
+                        try:
+                            candidate = Path(raw_path_arg).expanduser()
+                            exists = candidate.exists()
+                        except Exception:
+                            exists = False
+                        if exists:
+                            target_paths.append(raw_path_arg)
+                        else:
+                            for chunk in raw_path_arg.split(","):
+                                for segment in chunk.split():
+                                    if segment.strip():
+                                        target_paths.append(segment.strip())
+                    else:
+                        target_paths.append(raw_path_arg)
+                if tool_name == "patch" and str(args.get("mode") or "replace") == "patch":
+                    import re
+
+                    for m in re.finditer(
+                        r"^\*\*\*\s*(Update|Add|Delete|Move)\s+File:\s*(.+)$",
+                        str(args.get("patch") or ""),
+                        re.MULTILINE,
+                    ):
+                        header_target = m.group(2).strip()
+                        if "->" in header_target:
+                            for segment in header_target.split("->"):
+                                if segment.strip():
+                                    target_paths.append(segment.strip())
+                        elif header_target:
+                            target_paths.append(header_target)
+                for raw_target in target_paths:
+                    try:
+                        target_resolved = Path(raw_target).expanduser().resolve()
+                        target_resolved.relative_to(vault_root)
+                    except Exception:
+                        return {
+                            "action": "block",
+                            "message": f"Path '{raw_target}' is outside the designated Obsidian vault.",
+                        }
+        except Exception as exc:
+            return {
+                "action": "block",
+                "message": f"Obsidian curator security check failed closed: {exc}",
+            }
     return None
 
 
@@ -824,10 +861,11 @@ def register(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
     pending_raw = ctx.state.get("pending_review")
-    if isinstance(pending_raw, dict) and pending_raw.get("status") == "running":
+    if isinstance(pending_raw, dict):
         pending = dict(pending_raw)
-        pending["status"] = "pending"
-        ctx.state.set("pending_review", pending)
+        if pending.get("status") in ("running", "failed"):
+            pending["status"] = "pending"
+            ctx.state.set("pending_review", pending)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
