@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -26,6 +29,8 @@ _parent_review_callback: Callable[[str], Any] | None = None
 _MESSAGE_CHAR_CAP = 12_000
 _DEFAULT_TOOLSETS = ("file", "skills")
 _ALWAYS_BLOCKED_TOOLS = ("skill_manage",)
+_DEFAULT_RETRY_SECONDS = 5 * 60 * 60
+_PENDING_HISTORY_CHAR_CAP = 28_000
 
 
 def _send_message_tool(args: dict[str, Any]) -> str:
@@ -221,6 +226,63 @@ def _update_session_history(
             _SESSION_HISTORIES[session_id] = existing[-_MAX_SESSION_MESSAGES:]
 
 
+def _bounded_history(history: Any, limit: int | None = None) -> list[dict[str, str]]:
+    if not isinstance(history, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    for message in history:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        content = _message_text(message).strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if len(content) > _MESSAGE_CHAR_CAP:
+            content = f"{content[:_MESSAGE_CHAR_CAP]}\n[... truncated ...]"
+        item = {"role": role, "content": content}
+        if not normalized or normalized[-1] != item:
+            normalized.append(item)
+    if limit is not None and limit > 0:
+        normalized = normalized[-limit:]
+    normalized = normalized[-_MAX_SESSION_MESSAGES:]
+    while normalized and len(json.dumps(normalized, ensure_ascii=False)) > _PENDING_HISTORY_CHAR_CAP:
+        normalized.pop(0)
+    return normalized
+
+
+def _is_transient_limit_error(text: str) -> bool:
+    lowered = text.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "http 429",
+            "[429]",
+            "rate limit",
+            "rate-limit",
+            "quota",
+            "resource has been exhausted",
+            "usage limit has been reached",
+        )
+    )
+
+
+def _retry_delay_seconds(text: str) -> int:
+    match = re.search(r"reset\s+after\s+([^\n\r\)\]}]+)", text, re.IGNORECASE)
+    if not match:
+        return _DEFAULT_RETRY_SECONDS
+    seconds = 0
+    for amount, unit in re.findall(r"(\d+)\s*([hms])", match.group(1), re.IGNORECASE):
+        seconds += int(amount) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
+    return max(1, seconds) if seconds else _DEFAULT_RETRY_SECONDS
+
+
+def _model_from_error(text: str) -> str:
+    for value in re.findall(r"\[([^\]]+)\]", text):
+        if "/" in value and value != "429":
+            return value
+    return ""
+
+
 def _launch(
     session_id: str,
     *,
@@ -276,10 +338,34 @@ def _launch(
     with _LOCK:
         if _LAUNCHING or _ACTIVE_CHILD:
             return False
+        reviewed_count = int(ctx.state.get("activity_count", 0) or 0)
+        history_snapshot = _bounded_history(
+            history, limit=interval if not initial_setup else None
+        )
+        existing_pending = ctx.state.get("pending_review")
+        pending = dict(existing_pending) if isinstance(existing_pending, dict) else {}
+        pending.update(
+            {
+                "review_id": str(pending.get("review_id") or uuid.uuid4()),
+                "source_session_id": session_id,
+                "history_snapshot": history_snapshot,
+                "reviewed_activity_count": reviewed_count,
+                "initial_setup": bool(initial_setup),
+                "platform": platform,
+                "model_mode": "override" if model_override else "inherit",
+                "model_override_at_launch": model_override,
+                "parent_model_at_launch": str(
+                    pending.get("parent_model_at_launch") or ""
+                ),
+                "status": "running",
+            }
+        )
         _LAUNCHING = True
         _ACTIVE_CHILD = "launching"
         _PENDING_NOTIFIER = _notifier()
         _PENDING_ORIGIN_TARGET = _resolve_origin_target(session_id, platform)
+        pending["origin_target"] = _PENDING_ORIGIN_TARGET
+        ctx.state.set("pending_review", pending)
         try:
             ctx.subagent_lifecycle.launch(
                 SubagentLaunchRequest(
@@ -299,12 +385,13 @@ def _launch(
                     parent_session_id=session_id or None,
                 )
             )
-            ctx.state.set("activity_count", 0)
             return True
         except Exception:
             _ACTIVE_CHILD = None
             _PENDING_NOTIFIER = None
             _PENDING_ORIGIN_TARGET = None
+            pending["status"] = "pending"
+            ctx.state.set("pending_review", pending)
             raise
         finally:
             _LAUNCHING = False
@@ -346,16 +433,50 @@ def _on_subagent_stop(**event: Any) -> None:
     global _ACTIVE_CHILD
     child_session_id = str(event.get("child_session_id") or "")
     with _LOCK:
-        if _CTX is None or child_session_id != _ACTIVE_CHILD:
+        ctx = _CTX
+        if ctx is None or child_session_id != _ACTIVE_CHILD:
             return
         _ACTIVE_CHILD = None
         origin_target = _ORIGIN_TARGETS.pop(child_session_id, None)
         callback = _NOTIFIERS.pop(child_session_id, None) or _parent_review_callback
-    summary = str(event.get("child_summary") or "").strip()
-    summary = " ".join(summary.split())
-    if not summary:
-        status = str(event.get("child_status") or "failed")
-        summary = f"📝 Obsidian Review: status {status}."
+        pending_raw = ctx.state.get("pending_review")
+        pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
+    child_status = str(event.get("child_status") or "failed")
+    raw_summary = str(event.get("child_summary") or "").strip()
+    normalized_error = " ".join(raw_summary.split())
+    transient = child_status != "completed" and _is_transient_limit_error(
+        normalized_error
+    )
+
+    if child_status == "completed":
+        reviewed_count = int(pending.get("reviewed_activity_count", 0) or 0)
+        current_count = int(ctx.state.get("activity_count", 0) or 0)
+        ctx.state.set("activity_count", max(0, current_count - reviewed_count))
+        ctx.state.set("pending_review", None)
+    elif pending:
+        pending["status"] = "retry_wait" if transient else "failed"
+        pending["attempts"] = int(pending.get("attempts", 0) or 0) + 1
+        pending["last_error"] = normalized_error[:2000]
+        pending["origin_target"] = origin_target or pending.get("origin_target")
+        if transient:
+            pending["failed_model"] = (
+                _model_from_error(normalized_error)
+                or str(pending.get("model_override_at_launch") or "")
+                or str(pending.get("parent_model_at_launch") or "")
+            )
+            pending["next_retry_at"] = time.time() + _retry_delay_seconds(
+                normalized_error
+            )
+        ctx.state.set("pending_review", pending)
+
+    summary = normalized_error
+    if transient:
+        summary = (
+            "📝 Obsidian Review: Ditunda karena limit provider; konteks tersimpan "
+            "dan akan dicoba ulang pada sinyal aman berikutnya."
+        )
+    elif not summary:
+        summary = f"📝 Obsidian Review: status {child_status}."
     else:
         for prefix in ("📝 Obsidian Review:", "Obsidian Review:", "Obsidian:"):
             if summary.startswith(prefix):
@@ -403,14 +524,145 @@ def _record_activity(event: dict[str, Any], *, source_type: str) -> None:
             return
         count = int(ctx.state.get("activity_count", 0) or 0) + 1
         ctx.state.set("activity_count", count)
+
+
+def _coalesce_pending_history(
+    pending: dict[str, Any], session_id: str, new_messages: list[dict[str, Any]]
+) -> None:
+    if not isinstance(pending, dict) or pending.get("source_session_id") != session_id:
+        return
+    history = list(pending.get("history_snapshot") or [])
+    for msg in new_messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip()
+        content = _message_text(msg).strip()
+        if role in ("user", "assistant") and content:
+            item = {"role": role, "content": content}
+            if not history or history[-1] != item:
+                history.append(item)
+    pending["history_snapshot"] = _bounded_history(history)
+
+
+def _should_trigger_pending_retry(
+    pending: dict[str, Any],
+    *,
+    current_parent_model: str,
+    current_plugin_override: str | None,
+    parent_turn_id: str,
+) -> bool:
+    if not isinstance(pending, dict) or pending.get("status") != "retry_wait":
+        return False
+    if parent_turn_id and str(pending.get("last_retry_parent_turn_id") or "") == parent_turn_id:
+        return False
+
+    failed_model = str(pending.get("failed_model") or "").strip()
+    mode = str(pending.get("model_mode") or "inherit")
+    now = time.time()
+    retry_after = float(pending.get("next_retry_at") or 0)
+
+    if mode == "override":
+        configured_override = str(current_plugin_override or "").strip()
+        # Sub-case B1: plugin model override changed away from failed model
+        if configured_override and configured_override != failed_model:
+            return True
+        # Sub-case B2: reset timer elapsed
+        if retry_after and now >= retry_after:
+            return True
+        return False
+
+    # Inherited model mode:
+    # Sub-case A1: user switched parent model
+    if current_parent_model and failed_model and current_parent_model != failed_model:
+        return True
+    # Sub-case A2: parent turn succeeded on same model (live health recovery proof)
+    if current_parent_model and failed_model and current_parent_model == failed_model:
+        return True
+    # Sub-case A3: reset timer elapsed
+    if retry_after and now >= retry_after:
+        return True
+    return False
+
+
+def _launch_if_due(event: dict[str, Any]) -> None:
+    ctx = _CTX
+    if ctx is None:
+        return
+    session_id = str(event.get("session_id") or "")
+    with _LOCK:
+        if session_id and session_id == _ACTIVE_CHILD:
+            return
+        pending_raw = ctx.state.get("pending_review")
+        pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
+        if pending:
+            new_messages: list[dict[str, Any]] = []
+            user_message = str(event.get("user_message") or "").strip()
+            assistant_response = str(event.get("assistant_response") or "").strip()
+            if user_message:
+                new_messages.append({"role": "user", "content": user_message})
+            if assistant_response:
+                new_messages.append(
+                    {"role": "assistant", "content": assistant_response}
+                )
+            _coalesce_pending_history(pending, session_id, new_messages)
+            settings = _settings(ctx)
+            current_override = settings.get("model_override")
+            if current_override:
+                current_override = str(current_override).strip() or None
+            parent_turn_id = str(event.get("turn_id") or "")
+            if pending.get("status") == "retry_wait":
+                if not _should_trigger_pending_retry(
+                    pending,
+                    current_parent_model=str(event.get("model") or "").strip(),
+                    current_plugin_override=current_override,
+                    parent_turn_id=parent_turn_id,
+                ):
+                    ctx.state.set("pending_review", pending)
+                    return
+                pending["last_retry_parent_turn_id"] = parent_turn_id
+                pending["parent_model_at_launch"] = str(
+                    event.get("model") or ""
+                ).strip()
+                pending["status"] = "pending"
+                ctx.state.set("pending_review", pending)
+                _launch(
+                    str(pending.get("source_session_id") or session_id),
+                    initial_setup=bool(pending.get("initial_setup")),
+                    conversation_history=pending.get("history_snapshot"),
+                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                )
+                return
+            if pending.get("status") == "pending":
+                ctx.state.set("pending_review", pending)
+                _launch(
+                    str(pending.get("source_session_id") or session_id),
+                    initial_setup=bool(pending.get("initial_setup")),
+                    conversation_history=pending.get("history_snapshot"),
+                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                )
+                return
+            if pending.get("status") in ("running", "failed"):
+                ctx.state.set("pending_review", pending)
+                return
+
+        interval = _review_interval(ctx)
+        if interval is None:
+            return
+        count = int(ctx.state.get("activity_count", 0) or 0)
         if count < interval:
             return
-        _launch(
+        parent_model = str(event.get("model") or "").strip()
+        if _launch(
             session_id,
             initial_setup=False,
             conversation_history=None,
             platform=str(event.get("platform") or ""),
-        )
+        ):
+            launched_pending_raw = ctx.state.get("pending_review")
+            if isinstance(launched_pending_raw, dict):
+                launched_pending = dict(launched_pending_raw)
+                launched_pending["parent_model_at_launch"] = parent_model
+                ctx.state.set("pending_review", launched_pending)
 
 
 def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
@@ -488,6 +740,7 @@ def _on_post_llm_call(**event: Any) -> None:
             [{"role": "assistant", "content": assistant_response}],
         )
     _record_activity(event, source_type="turn")
+    _launch_if_due(event)
 
 
 def _on_post_tool_call(**event: Any) -> None:
@@ -570,6 +823,11 @@ def _tool(
 def register(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
+    pending_raw = ctx.state.get("pending_review")
+    if isinstance(pending_raw, dict) and pending_raw.get("status") == "running":
+        pending = dict(pending_raw)
+        pending["status"] = "pending"
+        ctx.state.set("pending_review", pending)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)

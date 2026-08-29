@@ -12,7 +12,11 @@ Native Hermes background review plugin dedicated to managing any Obsidian vault.
   - **Tool-level blocking** via `blocked_tools`.
   - **Preloadable skills** via `skills` (loaded via `skill_view` before curation).
   - **Custom model override** via `model_override` in config or `model` in the setup tool (otherwise inherits the main chat model).
-- **Configurable Hybrid Triggers:** Enable/disable turn triggers (`trigger_on_turns`) and tool-call triggers (`trigger_on_tools`) independently.
+- **Configurable Hybrid Triggers:** Enable/disable turn triggers (`trigger_on_turns`) and tool-call triggers (`trigger_on_tools`) independently. Tool calls only count activity; automatic reviews wait for successful `post_llm_call`, after main agent finishes its full tool loop and final response.
+- **Durable Rate-Limit Recovery:** A failed 429/quota review keeps bounded pending context and activity watermark in plugin state instead of discarding work.
+  - With inherited parent model (`model_override: null`), next successful parent turn retries after model switch or same-model recovery.
+  - With dedicated `model_override`, parent success alone does not retry; changing override or reaching provider reset time makes retry eligible at next completed parent-turn boundary.
+  - No implicit fallback model.
 - **Origin-Targeted Notifications:** Sends concise review summaries starting with `📝 Obsidian Review:` directly back to your active chat channel (Telegram, Discord, WhatsApp, etc.).
 
 ---

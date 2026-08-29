@@ -238,6 +238,38 @@ def test_subsequent_activity_triggers_review_without_initial_setup_prompt(
     assert "This is the initial setup run" not in req.goal
 
 
+def test_post_tool_call_increments_counter_but_never_launches_subagent(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+            "trigger_on_turns": True,
+            "trigger_on_tools": True,
+        }
+    )
+    plugin.register(ctx)
+
+    # Reaching threshold via tool calls alone must NOT launch the child in mid-turn.
+    ctx.hooks["post_tool_call"](session_id="s1", tool_name="read_file")
+    assert ctx.state.get("activity_count") == 1
+    assert not ctx.subagent_lifecycle.requests
+
+    ctx.hooks["post_tool_call"](session_id="s1", tool_name="search_files")
+    assert ctx.state.get("activity_count") == 2
+    assert not ctx.subagent_lifecycle.requests
+
+    # Completed turn boundary (post_llm_call) safely launches the due review.
+    ctx.hooks["post_llm_call"](
+        session_id="s1", platform="telegram", conversation_history=[]
+    )
+    assert len(ctx.subagent_lifecycle.requests) == 1
+
+
 def test_completed_tool_calls_share_activity_counter_with_completed_turns(
     tmp_path, monkeypatch
 ):
@@ -263,6 +295,13 @@ def test_completed_tool_calls_share_activity_counter_with_completed_turns(
     assert not ctx.subagent_lifecycle.requests
 
     ctx.hooks["post_tool_call"](session_id="s1", tool_name="search_files")
+    assert ctx.state.get("activity_count") == 3
+    assert not ctx.subagent_lifecycle.requests
+
+    # Due review launches when the main turn completes safely
+    ctx.hooks["post_llm_call"](
+        session_id="s1", platform="telegram", conversation_history=[]
+    )
     assert len(ctx.subagent_lifecycle.requests) == 1
 
 
@@ -277,6 +316,438 @@ def test_curator_child_tool_calls_are_ignored_for_anti_loop(tmp_path, monkeypatc
 
     assert not ctx.subagent_lifecycle.requests
     assert ctx.state.get("activity_count", 0) == 0
+
+
+def test_launch_does_not_reset_activity_count_until_successful_stop(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1", platform="telegram", conversation_history=[]
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="s2", platform="telegram", conversation_history=[]
+    )
+    # Reaching threshold and launching child must NOT reset activity_count immediately.
+    assert ctx.state.get("activity_count") == 2
+    req = ctx.subagent_lifecycle.requests[0]
+
+    ctx.hooks["subagent_start"](child_session_id="curator-child-1", child_goal=req.goal)
+
+    # Activity arriving during review accumulates cleanly on top.
+    ctx.hooks["post_llm_call"](
+        session_id="s3", platform="telegram", conversation_history=[]
+    )
+    assert ctx.state.get("activity_count") == 3
+
+    # On success: only the reviewed watermark (2) is subtracted.
+    ctx.hooks["subagent_stop"](
+        child_session_id="curator-child-1",
+        child_summary="Obsidian: review completed.",
+        child_status="completed",
+    )
+    assert ctx.state.get("activity_count") == 1
+
+
+def test_failure_preserves_activity_count_and_persists_pending_review_on_429(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(
+        plugin,
+        "_resolve_origin_target",
+        lambda session_id, platform="": "telegram:8804634959",
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](
+        session_id="s1",
+        user_message="Important durable update.",
+        conversation_history=[],
+        platform="telegram",
+        model="antigravity/gemini-3.7-flash-high",
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        user_message="Important durable update.",
+        assistant_response="Ack.",
+        conversation_history=[],
+        platform="telegram",
+        model="antigravity/gemini-3.7-flash-high",
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        user_message="Second message.",
+        assistant_response="Second ack.",
+        conversation_history=[],
+        platform="telegram",
+        model="antigravity/gemini-3.7-flash-high",
+    )
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    req = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="curator-child-1", child_goal=req.goal)
+
+    # Simulate subagent failing with 429 quota exhaustion.
+    ctx.hooks["subagent_stop"](
+        child_session_id="curator-child-1",
+        child_summary='API call failed after 3 retries: HTTP 429: [antigravity/gemini-3.7-flash-high] Resource has been exhausted (reset after 5m 0s)',
+        child_status="failed",
+    )
+
+    # Activity count is preserved
+    assert ctx.state.get("activity_count") == 2
+
+    # Pending review state is persisted in ctx.state
+    pending = ctx.state.get("pending_review")
+    assert pending is not None
+    assert pending["source_session_id"] == "s1"
+    assert pending["failed_model"] == "antigravity/gemini-3.7-flash-high"
+    assert pending["model_mode"] == "inherit"
+    assert pending["origin_target"] == "telegram:8804634959"
+    assert pending["attempts"] == 1
+    assert "Second ack" in json.dumps(pending["history_snapshot"])
+    assert pending["next_retry_at"] > 0
+
+
+def _pending_retry_state(*, mode="inherit", failed_model="parent/model", retry_at=2_000.0):
+    return {
+        "review_id": "pending-1",
+        "source_session_id": "s1",
+        "history_snapshot": [{"role": "user", "content": "Pending durable fact"}],
+        "reviewed_activity_count": 2,
+        "model_mode": mode,
+        "model_override_at_launch": failed_model if mode == "override" else None,
+        "failed_model": failed_model,
+        "status": "retry_wait",
+        "attempts": 1,
+        "next_retry_at": retry_at,
+        "platform": "telegram",
+    }
+
+
+def test_inherited_model_retries_after_successful_same_model_turn(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    ctx.state.set("pending_review", _pending_retry_state())
+    plugin.register(ctx)
+
+    event = {
+        "session_id": "s1",
+        "turn_id": "parent-turn-1",
+        "model": "parent/model",
+        "assistant_response": "Main agent recovered.",
+        "conversation_history": [],
+        "platform": "telegram",
+    }
+    ctx.hooks["post_llm_call"](**event)
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    request = ctx.subagent_lifecycle.requests[0]
+    assert request.model is None
+    assert "Pending durable fact" in request.context
+    assert "Main agent recovered" in request.context
+
+    # Same signal cannot create another child.
+    ctx.hooks["post_llm_call"](**event)
+    assert len(ctx.subagent_lifecycle.requests) == 1
+
+
+def test_inherited_model_retries_after_successful_parent_model_change(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    ctx.state.set("pending_review", _pending_retry_state(failed_model="old/model"))
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="parent-turn-new-model",
+        model="new/model",
+        assistant_response="New model succeeded.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert ctx.subagent_lifecycle.requests[0].model is None
+
+
+def test_changed_parent_model_is_remembered_if_retry_error_omits_model(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    ctx.state.set("pending_review", _pending_retry_state(failed_model="old/model"))
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="parent-turn-new-model",
+        model="new/model",
+        assistant_response="New model succeeded.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="retry-child", child_goal=request.goal)
+    ctx.hooks["subagent_stop"](
+        child_session_id="retry-child",
+        child_summary="API call failed after 3 retries: HTTP 429: quota exhausted",
+        child_status="failed",
+    )
+
+    pending = ctx.state.get("pending_review")
+    assert pending is not None
+    assert pending["failed_model"] == "new/model"
+
+
+def test_dedicated_model_retries_after_override_change(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+            "model_override": "new/dedicated-model",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    ctx.state.set(
+        "pending_review",
+        _pending_retry_state(mode="override", failed_model="old/dedicated-model"),
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="parent-turn-1",
+        model="parent/model",
+        assistant_response="Main agent succeeded.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert ctx.subagent_lifecycle.requests[0].model == "new/dedicated-model"
+
+
+def test_dedicated_model_retries_after_retry_time(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 2_001.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+            "model_override": "dedicated/model",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    ctx.state.set(
+        "pending_review",
+        _pending_retry_state(mode="override", failed_model="dedicated/model"),
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="parent-turn-after-reset",
+        model="parent/model",
+        assistant_response="Safe boundary reached.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert ctx.subagent_lifecycle.requests[0].model == "dedicated/model"
+
+
+def test_running_pending_review_is_restored_after_plugin_restart(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    pending = _pending_retry_state()
+    pending["status"] = "running"
+    ctx.state.set("pending_review", pending)
+
+    plugin.register(ctx)
+
+    restored = ctx.state.get("pending_review")
+    assert restored is not None
+    assert restored["status"] == "pending"
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="first-turn-after-restart",
+        model="parent/model",
+        assistant_response="Main agent finished after restart.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert "Pending durable fact" in ctx.subagent_lifecycle.requests[0].context
+
+
+def test_inherited_failure_uses_parent_model_when_error_omits_model(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="trigger-turn",
+        model="parent/model-without-error-label",
+        assistant_response="Trigger turn completed.",
+        conversation_history=[],
+        platform="telegram",
+    )
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="curator-child", child_goal=request.goal)
+    ctx.hooks["subagent_stop"](
+        child_session_id="curator-child",
+        child_summary="API call failed after 3 retries: HTTP 429: quota exhausted",
+        child_status="failed",
+    )
+
+    pending = ctx.state.get("pending_review")
+    assert pending is not None
+    assert pending["failed_model"] == "parent/model-without-error-label"
+
+
+def test_dedicated_model_ignores_parent_success_before_retry_time(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+            "model_override": "dedicated/model",
+        }
+    )
+    ctx.state.set("activity_count", 2)
+    ctx.state.set(
+        "pending_review",
+        {
+            "review_id": "pending-1",
+            "source_session_id": "s1",
+            "history_snapshot": [{"role": "user", "content": "Pending fact"}],
+            "reviewed_activity_count": 2,
+            "model_mode": "override",
+            "model_override_at_launch": "dedicated/model",
+            "failed_model": "dedicated/model",
+            "status": "retry_wait",
+            "attempts": 1,
+            "next_retry_at": 2_000.0,
+        },
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        turn_id="parent-turn-1",
+        model="healthy-parent/model",
+        assistant_response="Main agent succeeded.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert not ctx.subagent_lifecycle.requests
+    pending_state = ctx.state.get("pending_review")
+    assert pending_state is not None
+    assert pending_state["status"] == "retry_wait"
 
 
 def test_activity_counter_resets_at_successful_launch_and_preserves_new_events(
@@ -299,14 +770,12 @@ def test_activity_counter_resets_at_successful_launch_and_preserves_new_events(
     ctx.hooks["post_llm_call"](
         session_id="s2", platform="telegram", conversation_history=[]
     )
-    assert ctx.state.get("activity_count") == 0
     req = ctx.subagent_lifecycle.requests[0]
 
     # Parent activity after launch belongs to the next interval.
     ctx.hooks["post_llm_call"](
         session_id="s1", platform="telegram", conversation_history=[]
     )
-    assert ctx.state.get("activity_count") == 1
 
     ctx.hooks["subagent_start"](child_session_id="curator-child-1", child_goal=req.goal)
     assert getattr(plugin, "_ACTIVE_CHILD") == "curator-child-1"
@@ -314,6 +783,13 @@ def test_activity_counter_resets_at_successful_launch_and_preserves_new_events(
     # Child startup must not erase parent activity accumulated after launch.
     ctx.hooks["pre_llm_call"](
         session_id="curator-child-1", platform="subagent", is_first_turn=True
+    )
+    assert ctx.state.get("activity_count") == 3
+
+    ctx.hooks["subagent_stop"](
+        child_session_id="curator-child-1",
+        child_summary="Obsidian: review complete.",
+        child_status="completed",
     )
     assert ctx.state.get("activity_count") == 1
 
@@ -634,6 +1110,14 @@ def test_trigger_on_turns_can_be_disabled(tmp_path, monkeypatch):
     assert len(ctx.subagent_lifecycle.requests) == 0
 
     ctx.hooks["post_tool_call"](session_id="s1", tool_name="read_file")
+    assert ctx.state.get("activity_count") == 1
+    assert len(ctx.subagent_lifecycle.requests) == 0
+
+    # Turns-only counting is disabled, but post_llm_call remains the safe launch boundary.
+    ctx.hooks["post_llm_call"](
+        session_id="s1", platform="telegram", conversation_history=[]
+    )
+    assert ctx.state.get("activity_count") == 1
     assert len(ctx.subagent_lifecycle.requests) == 1
 
 
@@ -924,11 +1408,6 @@ def test_tool_trigger_uses_latest_chat_cache_not_tool_payload(tmp_path, monkeypa
         user_message="Durable project decision",
         conversation_history=[],
     )
-    ctx.hooks["post_llm_call"](
-        session_id="sess-tool-cache",
-        assistant_response="Decision acknowledged",
-        conversation_history=[{"role": "user", "content": "Durable project decision"}],
-    )
 
     ctx.hooks["post_tool_call"](
         session_id="sess-tool-cache",
@@ -941,6 +1420,13 @@ def test_tool_trigger_uses_latest_chat_cache_not_tool_payload(tmp_path, monkeypa
         tool_name="terminal",
         args={"command": "UNTRUSTED_TOOL_PAYLOAD_2"},
         result="UNTRUSTED_TOOL_RESULT_2",
+    )
+    assert not ctx.subagent_lifecycle.requests
+
+    ctx.hooks["post_llm_call"](
+        session_id="sess-tool-cache",
+        assistant_response="Decision acknowledged",
+        conversation_history=[{"role": "user", "content": "Durable project decision"}],
     )
 
     assert len(ctx.subagent_lifecycle.requests) == 1
