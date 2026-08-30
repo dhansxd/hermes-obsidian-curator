@@ -630,6 +630,61 @@ def _append_messages(queue: dict[str, Any], session_id: str, event: dict[str, An
             events.append(item)
 
 
+def _seal_active_session(
+    queue: dict[str, Any], old_session_id: str, new_session_id: str = ""
+) -> bool:
+    active_session_id = str(queue.get("active_session_id") or "")
+    if active_session_id != old_session_id:
+        return False
+    events = list(queue.get("events") or [])
+    activity_count = int(queue.get("activity_count", 0))
+    if events or activity_count:
+        queue.setdefault("sealed_batches", []).append(
+            {
+                "session_id": old_session_id,
+                "events": events,
+                "activity_count": activity_count,
+                "origin_target": queue.get("origin_target"),
+            }
+        )
+        queue["events"] = []
+        queue["activity_count"] = 0
+        queue["due"] = True
+    if new_session_id:
+        queue["active_session_id"] = new_session_id
+    return True
+
+
+def _on_session_finalize(**event: Any) -> None:
+    ctx = _CTX
+    if ctx is None:
+        return
+    old_session_id = str(event.get("old_session_id") or event.get("session_id") or "")
+    new_session_id = str(event.get("new_session_id") or "")
+    with _LOCK:
+        queues = _queues(ctx)
+        platform = _platform_key(event, queues)
+        queue = queues.get(platform)
+        if queue is not None and _seal_active_session(queue, old_session_id, new_session_id):
+            _save_queues(ctx, queues)
+
+
+def _on_session_reset(**event: Any) -> None:
+    ctx = _CTX
+    if ctx is None:
+        return
+    new_session_id = str(event.get("new_session_id") or event.get("session_id") or "")
+    if not new_session_id:
+        return
+    with _LOCK:
+        queues = _queues(ctx)
+        platform = _platform_key(event, queues)
+        queue = queues.get(platform)
+        if queue is not None:
+            queue["active_session_id"] = new_session_id
+            _save_queues(ctx, queues)
+
+
 def _on_pre_llm_call(**event: Any) -> None:
     ctx = _CTX
     if ctx is None:
@@ -646,20 +701,12 @@ def _on_pre_llm_call(**event: Any) -> None:
             platform = _platform_key(event, queues)
             queue = queues.setdefault(platform, {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False, "sealed_batches": []})
             previous = str(queue.get("active_session_id") or "")
-            if previous and session_id and previous != session_id and queue.get("events"):
-                queue.setdefault("sealed_batches", []).append(
-                    {
-                        "session_id": previous,
-                        "events": list(queue.get("events") or []),
-                        "activity_count": int(queue.get("activity_count", 0)),
-                        "origin_target": queue.get("origin_target"),
-                    }
-                )
-                queue["events"] = []
-                queue["activity_count"] = 0
-                queue["due"] = True
+            if previous and session_id and previous != session_id:
+                _seal_active_session(queue, previous, session_id)
             queue["active_session_id"] = session_id or previous
-            queue["origin_target"] = _resolve_origin_target(session_id, platform)
+            origin_target = _resolve_origin_target(session_id, platform)
+            if origin_target:
+                queue["origin_target"] = origin_target
             _append_messages(queue, session_id, {"user_message": user_message})
             _save_queues(ctx, queues)
 
@@ -708,6 +755,32 @@ def _on_subagent_stop(**event: Any) -> None:
                 if not pending.get("batch_sealed"):
                     queue["activity_count"] = max(0, int(queue.get("activity_count", 0)) - int(pending.get("reviewed_activity_count", 0)))
                 queue["due"] = bool(queue.get("sealed_batches")) or int(queue.get("activity_count", 0)) >= (_review_interval(ctx) or 20)
+                _save_queues(ctx, queues)
+            elif queue is not None and pending.get("batch_sealed"):
+                source_session_id = str(pending.get("source_session_id") or "")
+                reviewed_count = int(pending.get("reviewed_activity_count", 0) or 0)
+                removed = False
+                remaining_batches = []
+                for sealed in queue.get("sealed_batches", []):
+                    if (
+                        not removed
+                        and str(sealed.get("session_id") or "") == source_session_id
+                        and int(sealed.get("activity_count", 0) or 0) == reviewed_count
+                    ):
+                        removed = True
+                        continue
+                    remaining_batches.append(sealed)
+                queue["sealed_batches"] = remaining_batches
+                queue["due"] = bool(remaining_batches) or int(
+                    queue.get("activity_count", 0)
+                ) >= (_review_interval(ctx) or 20)
+                _save_queues(ctx, queues)
+            elif queue is not None:
+                queue["activity_count"] = max(
+                    0,
+                    int(queue.get("activity_count", 0))
+                    - int(pending.get("reviewed_activity_count", 0) or 0),
+                )
                 _save_queues(ctx, queues)
             else:
                 reviewed_count = int(pending.get("reviewed_activity_count", 0) or 0)
@@ -804,18 +877,8 @@ def _record_activity(event: dict[str, Any], *, source_type: str) -> None:
         queue = queues.setdefault(platform, {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False, "sealed_batches": []})
         if source_type == "turn":
             previous = str(queue.get("active_session_id") or "")
-            if previous and session_id and previous != session_id and queue.get("events"):
-                queue.setdefault("sealed_batches", []).append(
-                    {
-                        "session_id": previous,
-                        "events": list(queue.get("events") or []),
-                        "activity_count": int(queue.get("activity_count", 0)),
-                        "origin_target": queue.get("origin_target"),
-                    }
-                )
-                queue["events"] = []
-                queue["activity_count"] = 0
-                queue["due"] = True
+            if previous and session_id and previous != session_id:
+                _seal_active_session(queue, previous, session_id)
             queue["active_session_id"] = session_id or previous
             resolved_origin = _resolve_origin_target(session_id, platform)
             if resolved_origin:
@@ -1002,7 +1065,11 @@ def _launch_if_due(event: dict[str, Any]) -> None:
             history = [{"role": item["role"], "content": item["content"]} for item in batch]
             batch_ids = [str(item["id"]) for item in batch]
         else:
-            source_session_id = str(queue.get("active_session_id") or session_id)
+            source_session_id = str(
+                (sealed or {}).get("session_id")
+                or queue.get("active_session_id")
+                or session_id
+            )
             history = None
             batch_ids = []
         parent_model = str(event.get("model") or "").strip()
@@ -1128,6 +1195,9 @@ def _on_post_llm_call(**event: Any) -> None:
                     platform,
                     {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False},
                 )
+                origin_target = _resolve_origin_target(session_id, platform)
+                if origin_target:
+                    queue["origin_target"] = origin_target
                 _append_messages(
                     queue,
                     session_id,
@@ -1271,6 +1341,8 @@ def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("on_session_finalize", _on_session_finalize)
+    ctx.register_hook("on_session_reset", _on_session_reset)
     ctx.register_hook("subagent_start", _on_subagent_start)
     ctx.register_hook("subagent_stop", _on_subagent_stop)
     ctx.register_tool(

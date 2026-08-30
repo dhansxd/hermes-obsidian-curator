@@ -8,7 +8,7 @@ Native Hermes background review plugin dedicated to managing any Obsidian vault.
 - **Accurate History Snapshots:** Captures exact recent conversation turns (`user` & `assistant` messages) so the curator evaluates authentic session facts.
 - **Per-Platform Durable Queues & Session-Switch Flush:**
   - Maintains isolated queues per platform (`telegram`, `discord`, `whatsapp`, etc.) so multi-platform usage never cross-pollinates context.
-  - Switching `session_id` within the same platform automatically seals unreviewed events into a dedicated batch and triggers curation on the next safe turn boundary without waiting for `review_interval`.
+  - `/new` seals the abandoned session immediately, without waiting for another model turn. Direct `session_id` switches retain the same behavior; sealed work launches at the next safe completed turn without waiting for `review_interval`.
   - Single-global subagent execution prevents concurrent write races across different platform reviews.
   - Successful curation cleans up only reviewed batch event IDs; subsequent unreviewed user turns stay preserved in the queue. Failed/transient reviews keep the batch intact for retry.
 - **Flexible Capabilities (Cronjob-style):**

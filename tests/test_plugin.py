@@ -338,7 +338,7 @@ def test_launch_does_not_reset_activity_count_until_successful_stop(
         session_id="s1", platform="telegram", conversation_history=[]
     )
     ctx.hooks["post_llm_call"](
-        session_id="s2", platform="telegram", conversation_history=[]
+        session_id="s1", platform="telegram", conversation_history=[]
     )
     # Reaching threshold and launching child must NOT reset activity_count immediately.
     assert ctx.state.get("activity_count") == 2
@@ -348,7 +348,7 @@ def test_launch_does_not_reset_activity_count_until_successful_stop(
 
     # Activity arriving during review accumulates cleanly on top.
     ctx.hooks["post_llm_call"](
-        session_id="s3", platform="telegram", conversation_history=[]
+        session_id="s1", platform="telegram", conversation_history=[]
     )
     assert ctx.state.get("activity_count") == 3
 
@@ -981,7 +981,7 @@ def test_activity_counter_resets_at_successful_launch_and_preserves_new_events(
         session_id="s1", platform="telegram", conversation_history=[]
     )
     ctx.hooks["post_llm_call"](
-        session_id="s2", platform="telegram", conversation_history=[]
+        session_id="s1", platform="telegram", conversation_history=[]
     )
     req = ctx.subagent_lifecycle.requests[0]
 
@@ -1840,6 +1840,8 @@ def test_manifest_is_valid():
     assert "- pre_tool_call" in manifest
     assert "- post_llm_call" in manifest
     assert "- post_tool_call" in manifest
+    assert "- on_session_finalize" in manifest
+    assert "- on_session_reset" in manifest
     assert "- subagent_start" in manifest
     assert "- subagent_stop" in manifest
     assert "vault_path:" in manifest
@@ -2398,6 +2400,78 @@ def test_platform_queue_survives_plugin_reload(tmp_path):
     second.register(ctx)
     contents = [event["content"] for event in ctx.state.get("platform_queues")["telegram"]["events"]]
     assert "Durable queued fact" in contents
+
+
+def test_whatsapp_new_seals_old_batch_and_launches_it_on_next_turn(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    targets = {
+        "session-a": "whatsapp:111",
+        "session-b": "whatsapp:222",
+    }
+    monkeypatch.setattr(
+        plugin,
+        "_resolve_origin_target",
+        lambda session_id, platform="": targets.get(session_id),
+    )
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](session_id="session-a", platform="whatsapp", user_message="Old fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="session-a", platform="whatsapp", assistant_response="Old ack", conversation_history=[])
+    ctx.hooks["on_session_finalize"](
+        session_id="session-a",
+        old_session_id="session-a",
+        new_session_id="session-b",
+        platform="whatsapp",
+        reason="new",
+    )
+
+    queue = ctx.state.get("platform_queues")["whatsapp"]
+    assert queue["due"] is True
+    assert queue["active_session_id"] == "session-b"
+    assert queue["events"] == []
+    assert queue["sealed_batches"][0]["origin_target"] == "whatsapp:111"
+    assert not ctx.subagent_lifecycle.requests
+
+    ctx.hooks["pre_llm_call"](session_id="session-b", platform="whatsapp", user_message="New fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="session-b", platform="whatsapp", assistant_response="New ack", conversation_history=[])
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    request = ctx.subagent_lifecycle.requests[0]
+    assert "Old fact" in request.context
+    assert "Old ack" in request.context
+    assert "New fact" not in request.context
+    assert ctx.state.get("pending_review")["origin_target"] == "whatsapp:111"
+
+
+def test_session_switch_b_to_a_seals_symmetrically(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    monkeypatch.setattr(
+        plugin,
+        "_resolve_origin_target",
+        lambda session_id, platform="": f"whatsapp:{session_id}",
+    )
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](session_id="session-b", platform="whatsapp", user_message="B fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="session-b", platform="whatsapp", assistant_response="B ack", conversation_history=[])
+    ctx.hooks["on_session_finalize"](old_session_id="session-b", new_session_id="session-a", session_id="session-b", platform="whatsapp", reason="switch")
+    ctx.hooks["on_session_reset"](session_id="session-a", new_session_id="session-a", platform="whatsapp")
+
+    queue = ctx.state.get("platform_queues")["whatsapp"]
+    assert len(queue["sealed_batches"]) == 1
+    assert queue["sealed_batches"][0]["session_id"] == "session-b"
+    assert queue["sealed_batches"][0]["origin_target"] == "whatsapp:session-b"
+    ctx.hooks["pre_llm_call"](session_id="session-a", platform="whatsapp", user_message="A fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="session-a", platform="whatsapp", assistant_response="A ack", conversation_history=[])
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert "B fact" in ctx.subagent_lifecycle.requests[0].context
+    assert "A fact" not in ctx.subagent_lifecycle.requests[0].context
 
 
 def test_sealed_batch_success_preserves_new_session_count(tmp_path, monkeypatch):
