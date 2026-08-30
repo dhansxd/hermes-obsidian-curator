@@ -5,20 +5,39 @@ from __future__ import annotations
 import json
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 _MARKER = "OBSIDIAN_CURATOR_BACKGROUND_AGENT"
 _JOB_ID_PREFIX = "obsidian_curator_"
-_ALWAYS_BLOCKED_TOOLS = ("delegate_task", "skill_manage")
+_ALLOWED_TOOLSETS = frozenset({"file", "skills"})
+_ALWAYS_BLOCKED_TOOLS = (
+    "delegate_task",
+    "skill_manage",
+    "terminal",
+    "execute_code",
+    "browser_exec",
+    "computer_use",
+    "cronjob",
+)
+_SAFE_TOOLS = frozenset({
+    "read_file",
+    "write_file",
+    "patch",
+    "search_files",
+    "skill_view",
+    "skills_list",
+})
 _MAX_SESSION_MESSAGES = 40
 _MESSAGE_CHAR_CAP = 6_000
 _MAX_SUMMARY_CHARS = 1_000
+_MAX_RETRY_ATTEMPTS = 5
+_BASE_RETRY_DELAY_SECONDS = 30
 _LOCK = threading.RLock()
 _SESSION_HISTORIES: dict[str, list[dict[str, str]]] = {}
-_JOB_QUEUE: list[dict[str, Any]] = []
-_QUEUED_SESSIONS: set[str] = set()
+_FINALIZED_SESSIONS: set[str] = set()
 _ACTIVE_THREAD: threading.Thread | None = None
 _CTX: Any = None
 _PARENT_NOTIFIER: Callable[[str], Any] | None = None
@@ -108,7 +127,8 @@ def _bounded_history(history: Any, limit: int | None = None) -> list[dict[str, s
         if role not in ("user", "assistant") or not text:
             continue
         if len(text) > _MESSAGE_CHAR_CAP:
-            text = f"{text[:_MESSAGE_CHAR_CAP]}\n[... truncated ...]"
+            half = (_MESSAGE_CHAR_CAP - 30) // 2
+            text = f"{text[:half]}\n[... truncated ...]\n{text[-half:]}"
         item = {"role": role, "content": text}
         if not result or result[-1] != item:
             result.append(item)
@@ -132,6 +152,15 @@ def _update_session_history(session_id: str, messages: Any, *, replace: bool = F
         _SESSION_HISTORIES[session_id] = current[-_MAX_SESSION_MESSAGES:]
 
 
+def _cleanup_session_history(session_id: str) -> None:
+    if not session_id:
+        return
+    with _LOCK:
+        if session_id in _FINALIZED_SESSIONS and _get_activity_count(_CTX, session_id) == 0:
+            _SESSION_HISTORIES.pop(session_id, None)
+            _FINALIZED_SESSIONS.discard(session_id)
+
+
 def _format_context(history: Any) -> str | None:
     valid = _bounded_history(history)
     if not valid:
@@ -147,13 +176,16 @@ def _format_context(history: Any) -> str | None:
 
 
 def _settings(ctx: Any) -> dict[str, Any]:
+    configured = ctx.get_config("enabled_toolsets")
+    if configured is None:
+        configured = ctx.get_config("allowed_toolsets", ["file", "skills"])
     return {
         "vault_path": ctx.get_config("vault_path", ""),
         "review_interval": ctx.get_config("review_interval"),
         "curator_prompt": ctx.get_config("curator_prompt", ""),
         "trigger_on_turns": ctx.get_config("trigger_on_turns", True),
         "trigger_on_tools": ctx.get_config("trigger_on_tools", True),
-        "enabled_toolsets": ctx.get_config("enabled_toolsets", ctx.get_config("allowed_toolsets", ["file", "skills"])),
+        "enabled_toolsets": configured,
         "blocked_tools": ctx.get_config("blocked_tools", []),
         "skills": ctx.get_config("skills", []),
         "model": ctx.get_config("model_override"),
@@ -182,38 +214,82 @@ def _format_summary(raw: str, default: str = "curation completed.") -> str:
     return f"📝 Obsidian Review: {summary or default}"
 
 
-def _deliver_notification(summary: str, origin_target: str | None) -> None:
+def _deliver_notification(summary: str, origin_target: str | None) -> bool:
     if origin_target:
-        _send_message_tool({"action": "send", "target": origin_target, "message": summary})
-    elif _PARENT_NOTIFIER:
-        _PARENT_NOTIFIER(summary)
+        try:
+            raw = _send_message_tool({"action": "send", "target": origin_target, "message": summary})
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(data, dict) and data.get("error"):
+                return False
+            return True
+        except Exception:
+            return False
+    if _PARENT_NOTIFIER:
+        try:
+            _PARENT_NOTIFIER(summary)
+            return True
+        except Exception:
+            return False
+    return True
 
 
 def _session_counts(ctx: Any) -> dict[str, int]:
-    counts = ctx.state.get("session_activity_counts")
-    if isinstance(counts, dict):
-        return counts
+    if ctx is None:
+        return {}
+    try:
+        counts = ctx.state.get("session_activity_counts")
+        if isinstance(counts, dict):
+            return {str(k): int(v) for k, v in counts.items() if str(k).strip() and isinstance(v, (int, float)) and int(v) > 0}
+    except Exception:
+        pass
     return {}
 
 
 def _get_activity_count(ctx: Any, session_id: str) -> int:
-    if not session_id:
+    if not session_id or ctx is None:
         return 0
     return int(_session_counts(ctx).get(session_id, 0) or 0)
 
 
 def _set_activity_count(ctx: Any, session_id: str, count: int) -> None:
-    if not session_id:
+    if not session_id or ctx is None:
         return
     counts = dict(_session_counts(ctx))
     if count <= 0:
         counts.pop(session_id, None)
     else:
-        counts[session_id] = count
-    ctx.state.set("session_activity_counts", counts)
+        counts[session_id] = int(count)
+    try:
+        ctx.state.set("session_activity_counts", counts)
+    except Exception:
+        pass
+
+
+def _get_persisted_queue(ctx: Any) -> list[dict[str, Any]]:
+    if ctx is None:
+        return []
+    try:
+        items = ctx.state.get("pending_reviews")
+        if isinstance(items, list):
+            return [dict(x) for x in items if isinstance(x, dict) and x.get("id")]
+    except Exception:
+        pass
+    return []
+
+
+def _set_persisted_queue(ctx: Any, items: list[dict[str, Any]]) -> None:
+    if ctx is None:
+        return
+    try:
+        ctx.state.set("pending_reviews", items)
+    except Exception:
+        pass
 
 
 def _cron_job(settings: dict[str, Any], prompt: str) -> dict[str, Any]:
+    toolsets = settings.get("enabled_toolsets")
+    if toolsets is None:
+        toolsets = list(_ALLOWED_TOOLSETS)
     return {
         "id": f"{_JOB_ID_PREFIX}{uuid.uuid4().hex}",
         "name": "Obsidian curator",
@@ -222,7 +298,7 @@ def _cron_job(settings: dict[str, Any], prompt: str) -> dict[str, Any]:
         "model": settings.get("model") or None,
         "provider": settings.get("provider") or None,
         "base_url": settings.get("base_url") or None,
-        "enabled_toolsets": settings.get("enabled_toolsets"),
+        "enabled_toolsets": [str(t) for t in toolsets],
         "reasoning_effort": settings.get("reasoning_effort") or None,
         "workdir": settings.get("workdir") or None,
         "deliver": "local",
@@ -236,27 +312,73 @@ def _worker() -> None:
     from cron.scheduler import run_job
 
     while True:
-        with _LOCK:
-            if not _JOB_QUEUE:
+        ctx = _CTX
+        if ctx is None:
+            with _LOCK:
                 _ACTIVE_THREAD = None
-                return
-            item = _JOB_QUEUE.pop(0)
+            return
+
+        now = time.time()
+        item: dict[str, Any] | None = None
+        wait_seconds = 0.0
+        with _LOCK:
+            queue = _get_persisted_queue(ctx)
+            for idx, candidate in enumerate(queue):
+                if float(candidate.get("next_retry_at", 0) or 0) <= now:
+                    item = candidate
+                    queue.pop(idx)
+                    _set_persisted_queue(ctx, queue)
+                    break
+            if item is None:
+                if queue:
+                    wait_seconds = max(0.1, min(float(x.get("next_retry_at", now) or now) for x in queue) - now)
+                else:
+                    _ACTIVE_THREAD = None
+                    return
+        if item is None:
+            time.sleep(wait_seconds)
+            continue
+
+        session_id = str(item.get("session_id") or "")
         try:
             success, _, final_response, error = run_job(item["job"])
         except Exception as exc:
             success, final_response, error = False, "", str(exc)
-        ctx = _CTX
-        with _LOCK:
-            _QUEUED_SESSIONS.discard(item["session_id"])
-            if success and ctx is not None:
-                current = _get_activity_count(ctx, item["session_id"])
-                _set_activity_count(ctx, item["session_id"], max(0, current - item["reviewed_count"]))
+
         summary = _format_summary(final_response if success else error or final_response, "curation failed.")
-        _deliver_notification(summary, item["origin_target"])
+        delivered = _deliver_notification(summary, item.get("origin_target")) if (success or not item.get("silent_on_failure")) else False
+
+        with _LOCK:
+            if success:
+                current = _get_activity_count(ctx, session_id)
+                remaining = max(0, current - int(item.get("reviewed_count", 0) or 0))
+                _set_activity_count(ctx, session_id, remaining)
+                _cleanup_session_history(session_id)
+                if remaining > 0 and session_id in _FINALIZED_SESSIONS:
+                    _launch(session_id, initial_setup=False, origin_target=item.get("origin_target"))
+            else:
+                attempts = int(item.get("attempts", 1) or 1)
+                if attempts < _MAX_RETRY_ATTEMPTS:
+                    item["attempts"] = attempts + 1
+                    item["next_retry_at"] = time.time() + (_BASE_RETRY_DELAY_SECONDS * (2 ** (attempts - 1)))
+                    queue = _get_persisted_queue(ctx)
+                    queue.append(item)
+                    _set_persisted_queue(ctx, queue)
+                else:
+                    if not delivered:
+                        _deliver_notification(_format_summary(error or "curation failed after retries.", "curation failed permanently."), item.get("origin_target"))
+                    _cleanup_session_history(session_id)
+
+
+def _ensure_worker_running() -> None:
+    global _ACTIVE_THREAD
+    with _LOCK:
+        if _ACTIVE_THREAD is None or not _ACTIVE_THREAD.is_alive():
+            _ACTIVE_THREAD = threading.Thread(target=_worker, daemon=True, name="obsidian-curator-cron-runner")
+            _ACTIVE_THREAD.start()
 
 
 def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any = None, origin_target: str | None = None) -> bool:
-    global _ACTIVE_THREAD
     ctx = _CTX
     if ctx is None or not session_id:
         return False
@@ -267,6 +389,11 @@ def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any =
     curator_prompt = str(settings["curator_prompt"] or "").strip()
     if not curator_prompt:
         return False
+
+    toolsets = settings.get("enabled_toolsets")
+    if toolsets is not None and not set(toolsets).issubset(_ALLOWED_TOOLSETS):
+        return False
+
     interval = _review_interval(ctx) or 20
     history = conversation_history
     if history is None:
@@ -276,20 +403,24 @@ def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any =
     prompt = _prompt(vault_obj.resolve(), session_id, curator_prompt, initial_setup=initial_setup)
     if context:
         prompt = f"{prompt}\n\n{context}"
+
     item = {
+        "id": f"rev_{uuid.uuid4().hex}",
         "session_id": session_id,
         "reviewed_count": _get_activity_count(ctx, session_id),
         "origin_target": origin_target or _resolve_origin_target(session_id),
         "job": _cron_job(settings, prompt),
+        "attempts": 1,
+        "next_retry_at": 0,
+        "created_at": time.time(),
     }
     with _LOCK:
-        if session_id in _QUEUED_SESSIONS:
+        queue = _get_persisted_queue(ctx)
+        if any(x.get("session_id") == session_id for x in queue):
             return False
-        _JOB_QUEUE.append(item)
-        _QUEUED_SESSIONS.add(session_id)
-        if _ACTIVE_THREAD is None or not _ACTIVE_THREAD.is_alive():
-            _ACTIVE_THREAD = threading.Thread(target=_worker, daemon=True, name="obsidian-curator-cron-runner")
-            _ACTIVE_THREAD.start()
+        queue.append(item)
+        _set_persisted_queue(ctx, queue)
+        _ensure_worker_running()
     return True
 
 
@@ -341,13 +472,20 @@ def _on_post_llm_call(**event: Any) -> None:
 def _on_post_tool_call(**event: Any) -> None:
     if str(event.get("status") or "ok").lower() != "blocked":
         _record_activity(event, "tool")
+        _trigger_if_due(event)
 
 
 def _flush_session(event: dict[str, Any]) -> None:
     ctx = _CTX
     session_id = str(event.get("old_session_id") or event.get("session_id") or "")
+    if not session_id:
+        return
+    with _LOCK:
+        _FINALIZED_SESSIONS.add(session_id)
     if ctx is not None and _get_activity_count(ctx, session_id) > 0:
         _launch(session_id, initial_setup=False, origin_target=_resolve_origin_target(session_id, str(event.get("platform") or "")))
+    else:
+        _cleanup_session_history(session_id)
 
 
 def _on_session_finalize(**event: Any) -> None:
@@ -366,7 +504,7 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
     settings = _settings(ctx)
     tool_name = str(event.get("tool_name") or "")
     blocked = _ALWAYS_BLOCKED_TOOLS + tuple(str(value) for value in settings["blocked_tools"] or [])
-    if tool_name in blocked:
+    if tool_name in blocked or tool_name not in _SAFE_TOOLS:
         return {"action": "block", "message": f"Tool '{tool_name}' is disabled for the Obsidian curator."}
     if tool_name not in ("read_file", "write_file", "patch", "search_files"):
         return None
@@ -425,9 +563,29 @@ def _tool(args: dict[str, Any], parent_agent: Any = None, messages: Any = None, 
         lists = {key: _string_list(args, key) for key in ("enabled_toolsets", "blocked_tools", "skills")}
     except ValueError as exc:
         return tool_error(str(exc))
+
+    configured_toolsets = lists.get("enabled_toolsets")
+    if configured_toolsets is not None and not set(configured_toolsets).issubset(_ALLOWED_TOOLSETS):
+        return tool_error("enabled_toolsets only supports 'file' and 'skills'.")
+
     session_id = str(getattr(parent_agent, "session_id", "") or f"setup-{uuid.uuid4().hex}")
     history = messages if messages is not None else getattr(parent_agent, "messages", None)
-    previous = _settings(ctx)
+    previous = {
+        "vault_path": ctx.get_config("vault_path"),
+        "review_interval": ctx.get_config("review_interval"),
+        "curator_prompt": ctx.get_config("curator_prompt"),
+        "trigger_on_turns": ctx.get_config("trigger_on_turns"),
+        "trigger_on_tools": ctx.get_config("trigger_on_tools"),
+        "enabled_toolsets": ctx.get_config("enabled_toolsets"),
+        "allowed_toolsets": ctx.get_config("allowed_toolsets"),
+        "blocked_tools": ctx.get_config("blocked_tools"),
+        "skills": ctx.get_config("skills"),
+        "model_override": ctx.get_config("model_override"),
+        "provider": ctx.get_config("provider"),
+        "base_url": ctx.get_config("base_url"),
+        "reasoning_effort": ctx.get_config("reasoning_effort"),
+        "workdir": ctx.get_config("workdir"),
+    }
     try:
         ctx.set_config("vault_path", str(vault_obj.resolve()))
         ctx.set_config("review_interval", interval)
@@ -446,15 +604,26 @@ def _tool(args: dict[str, Any], parent_agent: Any = None, messages: Any = None, 
         return tool_result(ok=True, status="active", vault_path=str(vault_obj.resolve()))
     except Exception as exc:
         for key, value in previous.items():
-            ctx.set_config("model_override" if key == "model" else key, value)
+            try:
+                ctx.set_config(key, value)
+            except Exception:
+                pass
         return tool_error(f"Failed to launch initial curator review: {exc}")
 
 
 def register(ctx: Any) -> None:
     global _CTX
     _CTX = ctx
-    for name, hook in (("pre_llm_call", _on_pre_llm_call), ("pre_tool_call", _on_pre_tool_call), ("post_llm_call", _on_post_llm_call), ("post_tool_call", _on_post_tool_call), ("on_session_finalize", _on_session_finalize), ("on_session_reset", _on_session_reset)):
+    for name, hook in (
+        ("pre_llm_call", _on_pre_llm_call),
+        ("pre_tool_call", _on_pre_tool_call),
+        ("post_llm_call", _on_post_llm_call),
+        ("post_tool_call", _on_post_tool_call),
+        ("on_session_finalize", _on_session_finalize),
+        ("on_session_reset", _on_session_reset),
+    ):
         ctx.register_hook(name, hook)
+
     properties: dict[str, Any] = {
         "operation": {"type": "string", "enum": ["setup"]},
         "vault_path": {"type": "string"},
@@ -462,7 +631,7 @@ def register(ctx: Any) -> None:
         "curator_prompt": {"type": "string", "minLength": 1, "maxLength": 12000},
         "trigger_on_turns": {"type": "boolean"},
         "trigger_on_tools": {"type": "boolean"},
-        "enabled_toolsets": {"type": "array", "items": {"type": "string"}},
+        "enabled_toolsets": {"type": "array", "items": {"type": "string", "enum": ["file", "skills"]}},
         "blocked_tools": {"type": "array", "items": {"type": "string"}},
         "skills": {"type": "array", "items": {"type": "string"}},
         "model": {"type": "string"},
@@ -476,6 +645,16 @@ def register(ctx: Any) -> None:
         toolset="obsidian_curator",
         description="Configure turn-triggered Obsidian curation through Hermes' native cron runner.",
         emoji="🗂️",
-        schema={"name": "obsidian_curator", "description": "Configure turn-triggered Obsidian curation through Hermes' native cron runner.", "parameters": {"type": "object", "properties": properties, "required": ["operation", "vault_path", "review_interval", "curator_prompt"], "additionalProperties": False}},
+        schema={
+            "name": "obsidian_curator",
+            "description": "Configure turn-triggered Obsidian curation through Hermes' native cron runner.",
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": ["operation", "vault_path", "review_interval", "curator_prompt"],
+                "additionalProperties": False,
+            },
+        },
         handler=_tool,
     )
+    _ensure_worker_running()

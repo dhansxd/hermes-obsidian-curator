@@ -1,5 +1,5 @@
 name: obsidian-curator
-version: 0.8.1
+version: 0.8.2
 manifest_version: 1
 
 description: "Turn-triggered Obsidian curation using Hermes' native cron runner."
@@ -36,7 +36,7 @@ config_schema:
     default:
       - file
       - skills
-    description: "Toolsets passed directly to the native cron runner."
+    description: "Safe toolsets passed to the native cron runner; only file and skills are accepted."
   blocked_tools:
     type: list
     default: []

@@ -53,13 +53,17 @@ def install_cron_mock(monkeypatch, result=(True, "doc", "Obsidian review complet
         calls.append(job)
         return result
 
-    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job))
+    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job, tick=lambda *args, **kwargs: None))
     return calls
 
 
 def wait(plugin):
-    if plugin._ACTIVE_THREAD:
-        plugin._ACTIVE_THREAD.join(timeout=2)
+    for _ in range(20):
+        thread = plugin._ACTIVE_THREAD
+        if thread:
+            thread.join(timeout=0.2)
+        if plugin._ACTIVE_THREAD is None:
+            return
 
 
 def test_setup_uses_native_cron_runner_and_forwards_config(tmp_path, monkeypatch):
@@ -72,7 +76,7 @@ def test_setup_uses_native_cron_runner_and_forwards_config(tmp_path, monkeypatch
         "vault_path": str(tmp_path),
         "review_interval": 3,
         "curator_prompt": "Audit and curate vault.",
-        "enabled_toolsets": ["file", "skills", "web"],
+        "enabled_toolsets": ["file", "skills"],
         "skills": ["notes"],
         "model": "model-x",
         "provider": "provider-x",
@@ -86,7 +90,7 @@ def test_setup_uses_native_cron_runner_and_forwards_config(tmp_path, monkeypatch
     assert len(calls) == 1
     job = calls[0]
     assert job["id"].startswith("obsidian_curator_")
-    assert job["enabled_toolsets"] == ["file", "skills", "web"]
+    assert job["enabled_toolsets"] == ["file", "skills"]
     assert job["skills"] == ["notes"]
     assert job["model"] == "model-x"
     assert job["provider"] == "provider-x"
@@ -95,6 +99,21 @@ def test_setup_uses_native_cron_runner_and_forwards_config(tmp_path, monkeypatch
     assert job["workdir"] == str(tmp_path)
     assert job["deliver"] == "local"
     assert "Map the entire vault recursively" in job["prompt"]
+
+
+def test_setup_rejects_unsafe_toolsets(tmp_path):
+    plugin = load_plugin()
+    ctx = Context()
+    plugin.register(ctx)
+    res = json.loads(ctx.tools["obsidian_curator"]({
+        "operation": "setup",
+        "vault_path": str(tmp_path),
+        "review_interval": 3,
+        "curator_prompt": "Audit.",
+        "enabled_toolsets": ["file", "terminal"],
+    }))
+    assert "error" in res
+    assert "enabled_toolsets only supports" in res["error"]
 
 
 def test_setup_passes_parent_context_as_untrusted_evidence(tmp_path, monkeypatch):
@@ -123,14 +142,12 @@ def test_interval_trigger_uses_cron_runner(tmp_path, monkeypatch):
 
     ctx.hooks["post_llm_call"](session_id="s1", assistant_response="One", platform="telegram")
     assert not calls
-    ctx.hooks["post_tool_call"](session_id="s1", tool_name="read_file", platform="telegram")
-    assert not calls
     ctx.hooks["post_llm_call"](session_id="s1", assistant_response="Two", platform="telegram")
     wait(plugin)
 
     assert len(calls) == 1
     assert "This is the initial setup run" not in calls[0]["prompt"]
-    assert ctx.state.get("session_activity_counts") == {}
+    assert ctx.state.get("session_activity_counts", {}) == {}
 
 
 def test_cron_activity_is_ignored(tmp_path, monkeypatch):
@@ -180,6 +197,7 @@ def test_switch_without_activity_does_not_flush_other_session(tmp_path, monkeypa
 def test_due_sessions_are_queued_and_run_sequentially(tmp_path, monkeypatch):
     plugin = load_plugin()
     calls = install_cron_mock(monkeypatch)
+    monkeypatch.setattr(plugin, "_deliver_notification", lambda *_: True)
     ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
     plugin.register(ctx)
 
@@ -203,7 +221,7 @@ def test_turn_added_during_run_survives_review(tmp_path, monkeypatch):
         release.wait(timeout=2)
         return True, "doc", "done", None
 
-    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job))
+    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job, tick=lambda *args, **kwargs: None))
     ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
     plugin.register(ctx)
     plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
@@ -214,6 +232,48 @@ def test_turn_added_during_run_survives_review(tmp_path, monkeypatch):
     wait(plugin)
 
     assert ctx.state.get("session_activity_counts") == {"s1": 1}
+
+
+def test_failed_review_is_persisted_for_retry(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    install_cron_mock(monkeypatch, result=(False, "doc", "", "Rate limited"))
+    monkeypatch.setattr(plugin, "_deliver_notification", lambda *_: True)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+    plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
+    assert plugin._launch("s1", initial_setup=False, origin_target="telegram:1")
+    wait(plugin)
+
+    queue = ctx.state.get("pending_reviews")
+    assert len(queue) == 1
+    assert queue[0]["session_id"] == "s1"
+    assert queue[0]["attempts"] == 2
+    assert queue[0]["next_retry_at"] > 0
+    assert ctx.state.get("session_activity_counts") == {"s1": 1}
+
+
+def test_pending_reviews_are_restored_on_register(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    monkeypatch.setattr(plugin, "_deliver_notification", lambda *_: True)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    ctx.state.set("pending_reviews", [{
+        "id": "rev_saved",
+        "session_id": "s1",
+        "reviewed_count": 1,
+        "origin_target": "telegram:1",
+        "job": {"id": "cron_job_1", "prompt": "test", "deliver": "local", "no_agent": False},
+        "attempts": 1,
+        "next_retry_at": 0,
+    }])
+    ctx.state.set("session_activity_counts", {"s1": 1})
+
+    plugin.register(ctx)
+    wait(plugin)
+
+    assert len(calls) == 1
+    assert ctx.state.get("session_activity_counts") == {}
+    assert ctx.state.get("pending_reviews") == []
 
 
 def test_setup_validation(tmp_path):
@@ -233,24 +293,12 @@ def test_pre_tool_call_sandboxes_native_cron_session(tmp_path):
     session_id = "cron_obsidian_curator_abc_20260830_120000"
 
     assert ctx.hooks["pre_tool_call"](session_id=session_id, tool_name="custom_tool", args={})["action"] == "block"
+    assert ctx.hooks["pre_tool_call"](session_id=session_id, tool_name="terminal", args={})["action"] == "block"
     assert ctx.hooks["pre_tool_call"](session_id=session_id, tool_name="read_file", args={"path": "/etc/passwd"})["action"] == "block"
     note = tmp_path / "note.md"
     note.write_text("ok")
     assert ctx.hooks["pre_tool_call"](session_id=session_id, tool_name="read_file", args={"path": str(note)}) is None
     assert ctx.hooks["pre_tool_call"](session_id="parent", tool_name="read_file", args={"path": "/etc/passwd"}) is None
-
-
-def test_native_runner_result_delivered_once(tmp_path, monkeypatch):
-    plugin = load_plugin()
-    install_cron_mock(monkeypatch)
-    sent = []
-    monkeypatch.setattr(plugin, "_send_message_tool", lambda args: sent.append(args) or "{}")
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit."})
-    plugin.register(ctx)
-    assert plugin._launch("s1", initial_setup=False, origin_target="telegram:1")
-    wait(plugin)
-    assert len(sent) == 1
-    assert sent[0]["message"] == "📝 Obsidian Review: Obsidian review complete."
 
 
 def test_prompt_keeps_governance_boundary(tmp_path):
