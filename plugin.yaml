@@ -1,8 +1,8 @@
 name: obsidian-curator
-version: 0.6.5
+version: 0.7.0
 manifest_version: 1
 
-description: "One full native Hermes background agent whose only task is managing Obsidian."
+description: "One native standalone Hermes agent whose only task is Obsidian curation."
 author: Dani & Dyra
 provides_tools:
   - obsidian_curator
@@ -13,8 +13,6 @@ provides_hooks:
   - post_tool_call
   - on_session_finalize
   - on_session_reset
-  - subagent_start
-  - subagent_stop
 config_schema:
   vault_path:
     type: str
@@ -49,4 +47,4 @@ config_schema:
     description: "List of skills to preload before each curation pass."
   model_override:
     type: str
-    description: "Custom model override for the background curator subagent (default null = inherit parent session model)."
+    description: "Custom model override for the background curator agent (default null = inherit parent session model)."
