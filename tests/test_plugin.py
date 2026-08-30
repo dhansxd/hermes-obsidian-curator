@@ -130,7 +130,7 @@ def test_interval_trigger_uses_cron_runner(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     assert "This is the initial setup run" not in calls[0]["prompt"]
-    assert ctx.state.get("activity_count") == 0
+    assert ctx.state.get("session_activity_counts") == {}
 
 
 def test_cron_activity_is_ignored(tmp_path, monkeypatch):
@@ -140,8 +140,80 @@ def test_cron_activity_is_ignored(tmp_path, monkeypatch):
     plugin.register(ctx)
     ctx.hooks["post_llm_call"](session_id="cron_obsidian_curator_x_20260830", platform="cron")
     ctx.hooks["post_tool_call"](session_id="cron_obsidian_curator_x_20260830", platform="cron")
-    assert ctx.state.get("activity_count", 0) == 0
+    assert ctx.state.get("session_activity_counts", {}) == {}
     assert not calls
+
+
+def test_sessions_count_and_review_independently(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](session_id="telegram-a", assistant_response="Telegram one", platform="telegram")
+    ctx.hooks["post_llm_call"](session_id="whatsapp-b", assistant_response="WhatsApp one", platform="whatsapp")
+    assert ctx.state.get("session_activity_counts") == {"telegram-a": 1, "whatsapp-b": 1}
+    assert not calls
+
+    ctx.hooks["post_llm_call"](session_id="telegram-a", assistant_response="Telegram two", platform="telegram")
+    wait(plugin)
+    assert len(calls) == 1
+    assert "Telegram one" in calls[0]["prompt"]
+    assert "WhatsApp one" not in calls[0]["prompt"]
+    assert ctx.state.get("session_activity_counts") == {"whatsapp-b": 1}
+
+
+def test_switch_without_activity_does_not_flush_other_session(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](session_id="session-b", assistant_response="B activity", platform="telegram")
+    ctx.hooks["pre_llm_call"](session_id="session-a", conversation_history=[], platform="telegram")
+    ctx.hooks["on_session_finalize"](old_session_id="session-a", platform="telegram")
+
+    assert not calls
+    assert ctx.state.get("session_activity_counts") == {"session-b": 1}
+
+
+def test_due_sessions_are_queued_and_run_sequentially(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    plugin._record_activity({"session_id": "telegram-a", "platform": "telegram"}, "turn")
+    plugin._record_activity({"session_id": "whatsapp-b", "platform": "whatsapp"}, "turn")
+    assert plugin._launch("telegram-a", initial_setup=False, origin_target="telegram:1")
+    assert plugin._launch("whatsapp-b", initial_setup=False, origin_target="whatsapp:2")
+    wait(plugin)
+
+    assert len(calls) == 2
+    assert ctx.state.get("session_activity_counts") == {}
+
+
+def test_turn_added_during_run_survives_review(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    started = __import__("threading").Event()
+    release = __import__("threading").Event()
+
+    def run_job(job):
+        started.set()
+        release.wait(timeout=2)
+        return True, "doc", "done", None
+
+    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job))
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+    plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
+    assert plugin._launch("s1", initial_setup=False, origin_target="telegram:1")
+    assert started.wait(timeout=1)
+    plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
+    release.set()
+    wait(plugin)
+
+    assert ctx.state.get("session_activity_counts") == {"s1": 1}
 
 
 def test_setup_validation(tmp_path):

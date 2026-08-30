@@ -17,6 +17,8 @@ _MESSAGE_CHAR_CAP = 6_000
 _MAX_SUMMARY_CHARS = 1_000
 _LOCK = threading.RLock()
 _SESSION_HISTORIES: dict[str, list[dict[str, str]]] = {}
+_JOB_QUEUE: list[dict[str, Any]] = []
+_QUEUED_SESSIONS: set[str] = set()
 _ACTIVE_THREAD: threading.Thread | None = None
 _CTX: Any = None
 _PARENT_NOTIFIER: Callable[[str], Any] | None = None
@@ -187,6 +189,30 @@ def _deliver_notification(summary: str, origin_target: str | None) -> None:
         _PARENT_NOTIFIER(summary)
 
 
+def _session_counts(ctx: Any) -> dict[str, int]:
+    counts = ctx.state.get("session_activity_counts")
+    if isinstance(counts, dict):
+        return counts
+    return {}
+
+
+def _get_activity_count(ctx: Any, session_id: str) -> int:
+    if not session_id:
+        return 0
+    return int(_session_counts(ctx).get(session_id, 0) or 0)
+
+
+def _set_activity_count(ctx: Any, session_id: str, count: int) -> None:
+    if not session_id:
+        return
+    counts = dict(_session_counts(ctx))
+    if count <= 0:
+        counts.pop(session_id, None)
+    else:
+        counts[session_id] = count
+    ctx.state.set("session_activity_counts", counts)
+
+
 def _cron_job(settings: dict[str, Any], prompt: str) -> dict[str, Any]:
     return {
         "id": f"{_JOB_ID_PREFIX}{uuid.uuid4().hex}",
@@ -205,29 +231,34 @@ def _cron_job(settings: dict[str, Any], prompt: str) -> dict[str, Any]:
     }
 
 
-def _execute(job: dict[str, Any], origin_target: str | None, reviewed_count: int) -> None:
-    ctx = _CTX
-    try:
-        from cron.scheduler import run_job
+def _worker() -> None:
+    global _ACTIVE_THREAD
+    from cron.scheduler import run_job
 
-        success, _, final_response, error = run_job(job)
-        if success:
-            if ctx is not None:
-                with _LOCK:
-                    current = int(ctx.state.get("activity_count", 0) or 0)
-                    ctx.state.set("activity_count", max(0, current - reviewed_count))
-            summary = _format_summary(final_response)
-        else:
-            summary = _format_summary(error or final_response, "curation failed.")
-    except Exception as exc:
-        summary = _format_summary(str(exc), "curation failed.")
-    _deliver_notification(summary, origin_target)
+    while True:
+        with _LOCK:
+            if not _JOB_QUEUE:
+                _ACTIVE_THREAD = None
+                return
+            item = _JOB_QUEUE.pop(0)
+        try:
+            success, _, final_response, error = run_job(item["job"])
+        except Exception as exc:
+            success, final_response, error = False, "", str(exc)
+        ctx = _CTX
+        with _LOCK:
+            _QUEUED_SESSIONS.discard(item["session_id"])
+            if success and ctx is not None:
+                current = _get_activity_count(ctx, item["session_id"])
+                _set_activity_count(ctx, item["session_id"], max(0, current - item["reviewed_count"]))
+        summary = _format_summary(final_response if success else error or final_response, "curation failed.")
+        _deliver_notification(summary, item["origin_target"])
 
 
 def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any = None, origin_target: str | None = None) -> bool:
     global _ACTIVE_THREAD
     ctx = _CTX
-    if ctx is None:
+    if ctx is None or not session_id:
         return False
     settings = _settings(ctx)
     vault_obj = Path(str(settings["vault_path"])).expanduser()
@@ -245,40 +276,42 @@ def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any =
     prompt = _prompt(vault_obj.resolve(), session_id, curator_prompt, initial_setup=initial_setup)
     if context:
         prompt = f"{prompt}\n\n{context}"
-    job = _cron_job(settings, prompt)
+    item = {
+        "session_id": session_id,
+        "reviewed_count": _get_activity_count(ctx, session_id),
+        "origin_target": origin_target or _resolve_origin_target(session_id),
+        "job": _cron_job(settings, prompt),
+    }
     with _LOCK:
-        if _ACTIVE_THREAD is not None and _ACTIVE_THREAD.is_alive():
+        if session_id in _QUEUED_SESSIONS:
             return False
-        reviewed_count = int(ctx.state.get("activity_count", 0) or 0)
-        thread = threading.Thread(
-            target=_execute,
-            args=(job, origin_target or _resolve_origin_target(session_id), reviewed_count),
-            daemon=True,
-            name="obsidian-curator-cron-runner",
-        )
-        _ACTIVE_THREAD = thread
-        thread.start()
+        _JOB_QUEUE.append(item)
+        _QUEUED_SESSIONS.add(session_id)
+        if _ACTIVE_THREAD is None or not _ACTIVE_THREAD.is_alive():
+            _ACTIVE_THREAD = threading.Thread(target=_worker, daemon=True, name="obsidian-curator-cron-runner")
+            _ACTIVE_THREAD.start()
     return True
 
 
 def _record_activity(event: dict[str, Any], source_type: str) -> None:
     ctx = _CTX
-    if ctx is None or str(event.get("platform") or "").lower() == "cron":
+    session_id = str(event.get("session_id") or "")
+    if ctx is None or not session_id or str(event.get("platform") or "").lower() == "cron":
         return
     settings = _settings(ctx)
     if not settings["vault_path"] or not settings[f"trigger_on_{source_type}s"] or _review_interval(ctx) is None:
         return
     with _LOCK:
-        ctx.state.set("activity_count", int(ctx.state.get("activity_count", 0) or 0) + 1)
+        _set_activity_count(ctx, session_id, _get_activity_count(ctx, session_id) + 1)
 
 
 def _trigger_if_due(event: dict[str, Any]) -> None:
     ctx = _CTX
-    if ctx is None:
+    session_id = str(event.get("session_id") or "")
+    if ctx is None or not session_id:
         return
     interval = _review_interval(ctx)
-    if interval and int(ctx.state.get("activity_count", 0) or 0) >= interval:
-        session_id = str(event.get("session_id") or "")
+    if interval and _get_activity_count(ctx, session_id) >= interval:
         _launch(session_id, initial_setup=False, origin_target=_resolve_origin_target(session_id, str(event.get("platform") or "")))
 
 
@@ -312,8 +345,8 @@ def _on_post_tool_call(**event: Any) -> None:
 
 def _flush_session(event: dict[str, Any]) -> None:
     ctx = _CTX
-    if ctx is not None and int(ctx.state.get("activity_count", 0) or 0) > 0:
-        session_id = str(event.get("old_session_id") or event.get("session_id") or "")
+    session_id = str(event.get("old_session_id") or event.get("session_id") or "")
+    if ctx is not None and _get_activity_count(ctx, session_id) > 0:
         _launch(session_id, initial_setup=False, origin_target=_resolve_origin_target(session_id, str(event.get("platform") or "")))
 
 
@@ -392,7 +425,7 @@ def _tool(args: dict[str, Any], parent_agent: Any = None, messages: Any = None, 
         lists = {key: _string_list(args, key) for key in ("enabled_toolsets", "blocked_tools", "skills")}
     except ValueError as exc:
         return tool_error(str(exc))
-    session_id = str(getattr(parent_agent, "session_id", "") or "")
+    session_id = str(getattr(parent_agent, "session_id", "") or f"setup-{uuid.uuid4().hex}")
     history = messages if messages is not None else getattr(parent_agent, "messages", None)
     previous = _settings(ctx)
     try:
