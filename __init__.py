@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -31,6 +32,7 @@ _DEFAULT_TOOLSETS = ("file", "skills")
 _ALWAYS_BLOCKED_TOOLS = ("delegate_task", "skill_manage")
 _DEFAULT_RETRY_SECONDS = 5 * 60 * 60
 _PENDING_HISTORY_CHAR_CAP = 28_000
+_INTERNAL_PLATFORMS = {"", "cli", "cron", "desktop", "local", "subagent"}
 
 
 def _send_message_tool(args: dict[str, Any]) -> str:
@@ -42,18 +44,29 @@ def _send_message_tool(args: dict[str, Any]) -> str:
         return json.dumps({"error": str(exc)})
 
 
+def _pid_is_alive(pid: Any) -> bool:
+    try:
+        value = int(pid)
+        if value <= 0:
+            return False
+        os.kill(value, 0)
+        return True
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _resolve_origin_target(session_id: str, platform: str = "") -> str | None:
     try:
         from gateway.session_context import get_session_env
 
-        plat = (
-            str(platform or get_session_env("HERMES_SESSION_PLATFORM", "") or "")
-            .strip()
-            .lower()
-        )
+        requested = str(platform or "").strip().lower()
+        session_platform = str(
+            get_session_env("HERMES_SESSION_PLATFORM", "") or ""
+        ).strip().lower()
+        plat = session_platform if requested in _INTERNAL_PLATFORMS else requested
         chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
         thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
-        if plat and chat_id:
+        if plat not in _INTERNAL_PLATFORMS and chat_id:
             return f"{plat}:{chat_id}:{thread_id}" if thread_id else f"{plat}:{chat_id}"
     except Exception:
         pass
@@ -358,6 +371,7 @@ def _launch(
                     pending.get("parent_model_at_launch") or ""
                 ),
                 "status": "running",
+                "owner_pid": os.getpid(),
             }
         )
         _LAUNCHING = True
@@ -642,22 +656,36 @@ def _launch_if_due(event: dict[str, Any]) -> None:
                 pending["status"] = "pending"
                 ctx.state.set("pending_review", pending)
                 _launch(
-                    str(pending.get("source_session_id") or session_id),
+                    session_id,
                     initial_setup=bool(pending.get("initial_setup")),
                     conversation_history=pending.get("history_snapshot"),
-                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                    platform=str(event.get("platform") or pending.get("platform") or ""),
                 )
                 return
             if pending.get("status") == "pending":
                 ctx.state.set("pending_review", pending)
                 _launch(
-                    str(pending.get("source_session_id") or session_id),
+                    session_id,
                     initial_setup=bool(pending.get("initial_setup")),
                     conversation_history=pending.get("history_snapshot"),
-                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                    platform=str(event.get("platform") or pending.get("platform") or ""),
                 )
                 return
-            if pending.get("status") in ("running", "failed"):
+            if pending.get("status") == "running":
+                owner_pid = pending.get("owner_pid")
+                if _ACTIVE_CHILD or _pid_is_alive(owner_pid):
+                    ctx.state.set("pending_review", pending)
+                    return
+                pending["status"] = "pending"
+                ctx.state.set("pending_review", pending)
+                _launch(
+                    session_id,
+                    initial_setup=bool(pending.get("initial_setup")),
+                    conversation_history=pending.get("history_snapshot"),
+                    platform=str(event.get("platform") or pending.get("platform") or ""),
+                )
+                return
+            if pending.get("status") == "failed":
                 ctx.state.set("pending_review", pending)
                 return
 
@@ -863,7 +891,12 @@ def register(ctx: Any) -> None:
     pending_raw = ctx.state.get("pending_review")
     if isinstance(pending_raw, dict):
         pending = dict(pending_raw)
-        if pending.get("status") in ("running", "failed"):
+        if pending.get("status") == "running" and not _pid_is_alive(
+            pending.get("owner_pid")
+        ):
+            pending["status"] = "pending"
+            ctx.state.set("pending_review", pending)
+        elif pending.get("status") == "failed":
             pending["status"] = "pending"
             ctx.state.set("pending_review", pending)
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)

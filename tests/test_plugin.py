@@ -734,6 +734,96 @@ def test_running_pending_review_is_restored_after_plugin_restart(
     assert "Pending durable fact" in ctx.subagent_lifecycle.requests[0].context
 
 
+def test_running_review_owned_by_live_process_survives_plugin_registration(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "_pid_is_alive", lambda pid: pid == 123)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    pending = _pending_retry_state()
+    pending.update({"status": "running", "owner_pid": 123})
+    ctx.state.set("pending_review", pending)
+
+    plugin.register(ctx)
+
+    current = ctx.state.get("pending_review")
+    assert current is not None
+    assert current["status"] == "running"
+
+
+def test_orphaned_running_review_is_relaunched_without_gateway_restart(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    plugin.register(ctx)
+    ctx.state.set("activity_count", 2)
+    pending = _pending_retry_state()
+    pending["status"] = "running"
+    ctx.state.set("pending_review", pending)
+
+    ctx.hooks["post_llm_call"](
+        session_id="current-session",
+        turn_id="first-turn-after-orphan",
+        model="parent/model",
+        assistant_response="Main agent finished after orphaned review.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    request = ctx.subagent_lifecycle.requests[0]
+    assert request.parent_session_id == "current-session"
+    assert "Pending durable fact" in request.context
+
+
+def test_running_review_owned_by_live_process_is_not_relaunched(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "_pid_is_alive", lambda pid: pid == 123)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    plugin.register(ctx)
+    pending = _pending_retry_state()
+    pending.update({"status": "running", "owner_pid": 123})
+    ctx.state.set("pending_review", pending)
+
+    ctx.hooks["post_llm_call"](
+        session_id="current-session",
+        turn_id="turn-while-other-process-runs",
+        model="parent/model",
+        assistant_response="Do not duplicate live work.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert not ctx.subagent_lifecycle.requests
+    current = ctx.state.get("pending_review")
+    assert current is not None
+    assert current["status"] == "running"
+
+
 def test_inherited_failure_uses_parent_model_when_error_omits_model(
     tmp_path, monkeypatch
 ):
@@ -1282,6 +1372,38 @@ def test_resolve_origin_target_requires_both_platform_and_chat_id(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "gateway.session_context", fake_ctx)
     assert plugin._resolve_origin_target("sess", "") is None
+
+
+def test_resolve_origin_target_ignores_internal_cli_source(monkeypatch):
+    import sys
+
+    plugin = load_plugin()
+    fake_ctx = SimpleNamespace(
+        get_session_env=lambda key, default="": {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_CHAT_ID": "8804634959",
+            "HERMES_SESSION_THREAD_ID": "",
+        }.get(key, default)
+    )
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_ctx)
+
+    assert plugin._resolve_origin_target("sess", "cli") == "telegram:8804634959"
+
+
+def test_resolve_origin_target_rejects_internal_cli_destination(monkeypatch):
+    import sys
+
+    plugin = load_plugin()
+    fake_ctx = SimpleNamespace(
+        get_session_env=lambda key, default="": {
+            "HERMES_SESSION_PLATFORM": "cli",
+            "HERMES_SESSION_CHAT_ID": "8804634959",
+            "HERMES_SESSION_THREAD_ID": "",
+        }.get(key, default)
+    )
+    monkeypatch.setitem(sys.modules, "gateway.session_context", fake_ctx)
+
+    assert plugin._resolve_origin_target("sess", "cli") is None
 
 
 def test_prompt_permits_explicit_owner_designated_governance_files(tmp_path):
