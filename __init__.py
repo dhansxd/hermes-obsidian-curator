@@ -38,6 +38,9 @@ _ALWAYS_BLOCKED_TOOLS = ("delegate_task", "skill_manage")
 _DEFAULT_RETRY_SECONDS = 5 * 60 * 60
 _LAUNCH_TIMEOUT_SECONDS = 60
 _PENDING_HISTORY_CHAR_CAP = 28_000
+_MAX_QUEUE_EVENTS = 80
+_MAX_SEALED_BATCHES = 16
+_MAX_SUMMARY_CHARS = 1_000
 _QUEUE_STATE_KEY = "platform_queues"
 _INTERNAL_PLATFORMS = {"", "cli", "cron", "desktop", "local", "subagent"}
 
@@ -75,6 +78,7 @@ def _child_handle_is_alive(ctx: Any, pending: dict[str, Any]) -> bool:
                     SubagentState.PENDING,
                     SubagentState.STARTING,
                     SubagentState.RUNNING,
+                    SubagentState.CANCEL_REQUESTED,
                 ):
                     return True
                 if state in (
@@ -86,7 +90,8 @@ def _child_handle_is_alive(ctx: Any, pending: dict[str, Any]) -> bool:
                 ):
                     return False
         except Exception:
-            pass
+            return False
+        return False
     return _pid_is_alive(pending.get("owner_pid"))
 
 
@@ -350,6 +355,7 @@ def _launch(
     platform: str = "",
     batch_ids: list[str] | None = None,
     batch_sealed: bool = False,
+    origin_target: str | None = None,
 ) -> bool:
     global _ACTIVE_CHILD, _LAUNCHING, _PENDING_NOTIFIER, _PENDING_ORIGIN_TARGET
     ctx = _CTX
@@ -384,7 +390,10 @@ def _launch(
                 )
     settings = _settings(ctx)
     vault_value = settings.get("vault_path", "")
-    vault = Path(str(vault_value)).expanduser().resolve()
+    vault_path_obj = Path(str(vault_value)).expanduser()
+    if not vault_path_obj.is_absolute() or vault_path_obj.is_symlink():
+        return False
+    vault = vault_path_obj.resolve()
     if not vault.is_dir():
         return False
     curator_prompt = str(settings.get("curator_prompt") or "").strip()
@@ -392,11 +401,9 @@ def _launch(
         return False
     interval = _review_interval(ctx) or 20
     configured_toolsets = settings.get("allowed_toolsets")
-    allowed_toolsets = (
-        tuple(str(t) for t in configured_toolsets)
-        if configured_toolsets
-        else _DEFAULT_TOOLSETS
-    )
+    if configured_toolsets and set(configured_toolsets) != set(_DEFAULT_TOOLSETS):
+        return False
+    allowed_toolsets = _DEFAULT_TOOLSETS
     skills = tuple(str(s) for s in (settings.get("skills") or []))
     model_override = settings.get("model_override")
     if model_override:
@@ -425,6 +432,7 @@ def _launch(
         pending.update(
             {
                 "review_id": str(pending.get("review_id") or uuid.uuid4()),
+                "correlation_id": str(uuid.uuid4()),
                 "source_session_id": session_id,
                 "history_snapshot": history_snapshot,
                 "reviewed_activity_count": reviewed_count,
@@ -444,9 +452,15 @@ def _launch(
         )
         _LAUNCHING = True
         _ACTIVE_CHILD = "launching"
-        _PENDING_NOTIFIER = _notifier()
-        _PENDING_ORIGIN_TARGET = str(pending.get("origin_target") or "") or (
-            _resolve_origin_target(session_id, platform)
+        current_origin_target = _resolve_origin_target(session_id, platform)
+        _PENDING_ORIGIN_TARGET = str(
+            origin_target or pending.get("origin_target") or ""
+        ) or current_origin_target
+        _PENDING_NOTIFIER = (
+            _notifier()
+            if not _PENDING_ORIGIN_TARGET
+            or _PENDING_ORIGIN_TARGET == current_origin_target
+            else None
         )
         pending["origin_target"] = _PENDING_ORIGIN_TARGET
         ctx.state.set("pending_review", pending)
@@ -466,19 +480,28 @@ def _launch(
                     role="leaf",
                     allowed_toolsets=allowed_toolsets,
                     model=model_override,
-                    parent_session_id=session_id or None,
-                    correlation_id=str(pending["review_id"]),
+                    correlation_id=str(pending["correlation_id"]),
                 )
             )
-            if hasattr(handle, "to_dict"):
-                pending["handle"] = handle.to_dict()
-                ctx.state.set("pending_review", pending)
+            current = ctx.state.get("pending_review")
+            if (
+                hasattr(handle, "to_dict")
+                and isinstance(current, dict)
+                and current.get("review_id") == pending["review_id"]
+                and current.get("correlation_id") == pending["correlation_id"]
+            ):
+                current = dict(current)
+                current["handle"] = handle.to_dict()
+                ctx.state.set("pending_review", current)
             return True
         except Exception:
             _ACTIVE_CHILD = None
             _PENDING_NOTIFIER = None
             _PENDING_ORIGIN_TARGET = None
-            pending["status"] = "pending"
+            if pending.get("attempts") or pending.get("next_retry_at"):
+                pending["status"] = "retry_wait"
+            else:
+                pending["status"] = "pending"
             ctx.state.set("pending_review", pending)
             raise
         finally:
@@ -499,6 +522,48 @@ def _on_subagent_start(**event: Any) -> None:
         if _PENDING_ORIGIN_TARGET:
             _ORIGIN_TARGETS[child_session_id] = _PENDING_ORIGIN_TARGET
             _PENDING_ORIGIN_TARGET = None
+        ctx = _CTX
+        if ctx is not None:
+            pending_raw = ctx.state.get("pending_review")
+            if isinstance(pending_raw, dict):
+                pending = dict(pending_raw)
+                pending["child_session_id"] = child_session_id
+                ctx.state.set("pending_review", pending)
+
+
+def _prune_queue_preserving_batch_ids(
+    queue: dict[str, Any], preserved_batch_ids: set[str]
+) -> None:
+    events = list(queue.get("events") or [])
+    if len(events) > _MAX_QUEUE_EVENTS:
+        preserved: list[dict[str, Any]] = []
+        unpreserved: list[dict[str, Any]] = []
+        for e in events:
+            if isinstance(e, dict) and e.get("id") in preserved_batch_ids:
+                preserved.append(e)
+            else:
+                unpreserved.append(e)
+        allowed_unpreserved = max(0, _MAX_QUEUE_EVENTS - len(preserved))
+        kept_unpreserved = (
+            unpreserved[-allowed_unpreserved:] if allowed_unpreserved else []
+        )
+        queue["events"] = preserved + kept_unpreserved
+
+    sealed = list(queue.get("sealed_batches") or [])
+    if len(sealed) > _MAX_SEALED_BATCHES:
+        preserved_s: list[dict[str, Any]] = []
+        unpreserved_s: list[dict[str, Any]] = []
+        for b in sealed:
+            b_ids = {e.get("id") for e in b.get("events", []) if isinstance(e, dict)}
+            if b_ids & preserved_batch_ids:
+                preserved_s.append(b)
+            else:
+                unpreserved_s.append(b)
+        allowed_unpreserved_s = max(0, _MAX_SEALED_BATCHES - len(preserved_s))
+        kept_unpreserved_s = (
+            unpreserved_s[-allowed_unpreserved_s:] if allowed_unpreserved_s else []
+        )
+        queue["sealed_batches"] = preserved_s + kept_unpreserved_s
 
 
 def _platform_key(event: dict[str, Any], queues: dict[str, Any]) -> str:
@@ -518,13 +583,25 @@ def _queues(ctx: Any) -> dict[str, dict[str, Any]]:
 
 
 def _save_queues(ctx: Any, queues: dict[str, dict[str, Any]]) -> None:
+    pending = ctx.state.get("pending_review")
+    preserved_batch_ids = (
+        set(pending.get("batch_ids") or []) if isinstance(pending, dict) else set()
+    )
     for queue in queues.values():
         if not isinstance(queue.get("events"), list):
             queue["events"] = []
         if not isinstance(queue.get("sealed_batches"), list):
             queue["sealed_batches"] = []
+        _prune_queue_preserving_batch_ids(queue, preserved_batch_ids)
     ctx.state.set(_QUEUE_STATE_KEY, queues)
-    ctx.state.set("activity_count", sum(int(q.get("activity_count", 0)) for q in queues.values()))
+    ctx.state.set(
+        "activity_count",
+        sum(
+            int(q.get("activity_count", 0))
+            + sum(int(batch.get("activity_count", 0)) for batch in q["sealed_batches"])
+            for q in queues.values()
+        ),
+    )
 
 
 def _append_messages(queue: dict[str, Any], session_id: str, event: dict[str, Any]) -> None:
@@ -575,12 +652,14 @@ def _on_pre_llm_call(**event: Any) -> None:
                         "session_id": previous,
                         "events": list(queue.get("events") or []),
                         "activity_count": int(queue.get("activity_count", 0)),
+                        "origin_target": queue.get("origin_target"),
                     }
                 )
                 queue["events"] = []
                 queue["activity_count"] = 0
                 queue["due"] = True
             queue["active_session_id"] = session_id or previous
+            queue["origin_target"] = _resolve_origin_target(session_id, platform)
             history = event.get("conversation_history")
             if isinstance(history, list) and history and not queue.get("events"):
                 _append_messages(queue, session_id, {"conversation_history": history})
@@ -600,13 +679,20 @@ def _on_subagent_stop(**event: Any) -> None:
 
     with _LOCK:
         ctx = _CTX
-        if ctx is None or child_session_id != _ACTIVE_CHILD:
+        if ctx is None:
             return
-        _ACTIVE_CHILD = None
-        origin_target = _ORIGIN_TARGETS.pop(child_session_id, None)
-        callback = _NOTIFIERS.pop(child_session_id, None) or _parent_review_callback
         pending_raw = ctx.state.get("pending_review")
         pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
+        if child_session_id not in (
+            _ACTIVE_CHILD,
+            str(pending.get("child_session_id") or ""),
+        ):
+            return
+        _ACTIVE_CHILD = None
+        origin_target = _ORIGIN_TARGETS.pop(child_session_id, None) or pending.get(
+            "origin_target"
+        )
+        callback = _NOTIFIERS.pop(child_session_id, None) or _parent_review_callback
 
         if child_status in ("completed", "success"):
             queues = _queues(ctx)
@@ -650,7 +736,8 @@ def _on_subagent_stop(**event: Any) -> None:
             pending["next_retry_at"] = time.time() + delay
             ctx.state.set("pending_review", pending)
 
-    summary = normalized_error
+    summary = re.sub(r"media\s*:", "MEDIA\u200b:", normalized_error, flags=re.IGNORECASE)
+    summary = summary[:_MAX_SUMMARY_CHARS]
     if transient:
         summary = (
             "📝 Obsidian Review: Ditunda karena limit provider; konteks tersimpan "
@@ -664,16 +751,14 @@ def _on_subagent_stop(**event: Any) -> None:
                 summary = summary[len(prefix) :].strip()
                 break
         summary = f"📝 Obsidian Review: {summary}"
-    delivered = False
     if origin_target:
         try:
-            raw = _send_message_tool(
+            _send_message_tool(
                 {"action": "send", "target": origin_target, "message": summary}
             )
-            delivered = bool(json.loads(raw).get("success"))
         except Exception:
-            delivered = False
-    if not delivered and callback:
+            pass
+    elif callback:
         try:
             callback(summary)
         except Exception:
@@ -728,12 +813,16 @@ def _record_activity(event: dict[str, Any], *, source_type: str) -> None:
                         "session_id": previous,
                         "events": list(queue.get("events") or []),
                         "activity_count": int(queue.get("activity_count", 0)),
+                        "origin_target": queue.get("origin_target"),
                     }
                 )
                 queue["events"] = []
                 queue["activity_count"] = 0
                 queue["due"] = True
             queue["active_session_id"] = session_id or previous
+            resolved_origin = _resolve_origin_target(session_id, platform)
+            if resolved_origin:
+                queue["origin_target"] = resolved_origin
         queue["activity_count"] = int(queue.get("activity_count", 0)) + 1
         if queue["activity_count"] >= interval:
             queue["due"] = True
@@ -927,6 +1016,7 @@ def _launch_if_due(event: dict[str, Any]) -> None:
             platform=due_platform,
             batch_ids=batch_ids,
             batch_sealed=bool(sealed),
+            origin_target=(sealed or queue).get("origin_target"),
         ):
             launched_pending_raw = ctx.state.get("pending_review")
             if isinstance(launched_pending_raw, dict):
@@ -963,7 +1053,13 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
                         "action": "block",
                         "message": "Obsidian vault path is unconfigured or unavailable.",
                     }
-                vault_root = Path(vault_raw).expanduser().resolve()
+                vault_path_obj = Path(vault_raw).expanduser()
+                if not vault_path_obj.is_absolute() or vault_path_obj.is_symlink():
+                    return {
+                        "action": "block",
+                        "message": "Configured Obsidian vault path must be absolute and must not be a symbolic link.",
+                    }
+                vault_root = vault_path_obj.resolve()
                 args = event.get("args") or {}
                 if not isinstance(args, dict) or not args.get("path") and not (
                     tool_name == "patch"
@@ -1000,7 +1096,13 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
                         }
                 for raw_target in target_paths:
                     try:
-                        target_resolved = Path(raw_target).expanduser().resolve()
+                        raw_target_path = Path(raw_target).expanduser()
+                        if not raw_target_path.is_absolute():
+                            return {
+                                "action": "block",
+                                "message": f"Path '{raw_target}' must be absolute and inside the designated Obsidian vault.",
+                            }
+                        target_resolved = raw_target_path.resolve()
                         target_resolved.relative_to(vault_root)
                     except Exception:
                         return {
@@ -1053,7 +1155,12 @@ def _tool(
     if str(args.get("operation") or "").lower() != "setup":
         return tool_error("Unsupported operation.")
     raw_vault = str(args.get("vault_path") or "")
-    vault = Path(raw_vault).expanduser().resolve()
+    raw_vault_path = Path(raw_vault).expanduser()
+    if not raw_vault_path.is_absolute():
+        return tool_error("vault_path must be an absolute path.")
+    if raw_vault_path.is_symlink():
+        return tool_error("vault_path must not be a symbolic link.")
+    vault = raw_vault_path.resolve()
     if not vault.is_dir():
         return tool_error("vault_path must be an existing directory.")
     try:
@@ -1067,6 +1174,12 @@ def _tool(
         return tool_error("curator_prompt must be a non-empty string.")
     if len(curator_prompt) > 12000:
         return tool_error("curator_prompt must be at most 12000 characters.")
+    if "allowed_toolsets" in args:
+        raw_toolsets = args.get("allowed_toolsets")
+        if not isinstance(raw_toolsets, list) or set(raw_toolsets) != set(
+            _DEFAULT_TOOLSETS
+        ):
+            return tool_error("allowed_toolsets must be exactly ['file', 'skills'].")
     session_id = ""
     history = messages
     if parent_agent is not None:
@@ -1112,12 +1225,15 @@ def _tool(
             if "model" in args:
                 raw_model = str(args.get("model") or "").strip()
                 ctx.set_config("model_override", raw_model or None)
-            _launch(session_id, initial_setup=True, conversation_history=history)
+            if not _launch(session_id, initial_setup=True, conversation_history=history):
+                raise RuntimeError("lifecycle rejected launch")
             return tool_result(ok=True, status="active", vault_path=str(vault))
         except Exception as exc:
             for key, val in previous_settings.items():
-                if val is not None:
+                try:
                     ctx.set_config(key, val)
+                except Exception:
+                    pass
             return tool_error(f"Failed to launch initial curator review: {exc}")
 
 

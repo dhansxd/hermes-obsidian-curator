@@ -12,7 +12,7 @@ Native Hermes background review plugin dedicated to managing any Obsidian vault.
   - Single-global subagent execution prevents concurrent write races across different platform reviews.
   - Successful curation cleans up only reviewed batch event IDs; subsequent unreviewed user turns stay preserved in the queue. Failed/transient reviews keep the batch intact for retry.
 - **Flexible Capabilities (Cronjob-style):**
-  - **Safe `file` + `skills` toolsets by default** (customizable via `allowed_toolsets`).
+  - **Fixed safe `file` + `skills` toolsets**; setup rejects any other `allowed_toolsets`.
   - **Vault path enforcement** blocks file reads/writes/searches outside the configured vault.
   - **Tool-level blocking** via `blocked_tools` (and `delegate_task` is always blocked for the curator child while parent delegation remains unaffected).
   - **Preloadable skills** via `skills` (loaded via `skill_view` before curation).
@@ -75,7 +75,7 @@ Or invoke the setup tool directly:
 | `curator_prompt` | string | *required* | Custom instructions telling the curator how to organize and curate your specific vault. |
 | `trigger_on_turns` | boolean | `true` | When `true`, completed conversation turns count towards `review_interval`. |
 | `trigger_on_tools` | boolean | `true` | When `true`, completed tool calls count towards `review_interval`. |
-| `allowed_toolsets` | array | `["file", "skills"]` | Toolsets allowed for the curator. Add others only when your curator instructions require them. |
+| `allowed_toolsets` | array | `["file", "skills"]` | Fixed toolsets allowed for curator (`file` and `skills`). |
 | `blocked_tools` | array | `[]` | Optional list of specific tool names to block (e.g. `["terminal"]`). |
 | `skills` | array | `[]` | Optional list of skills to preload before curation (e.g. `["obsidian", "grounded-citations"]`). |
 | `model_override` | string | `null` | Optional custom model override in plugin config. The setup tool accepts this as its `model` argument. Default inherits parent session. |

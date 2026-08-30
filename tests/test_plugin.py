@@ -205,7 +205,7 @@ def test_setup_passes_parent_context_when_available(tmp_path, monkeypatch):
     )
 
     req = ctx.subagent_lifecycle.requests[0]
-    assert req.parent_session_id == "parent-123"
+    assert not hasattr(req, "parent_session_id")
     assert "mangrove fringe reduces erosion by 66 percent" in req.context
     assert "NON-AUTHORITATIVE CANDIDATE EVIDENCE" in req.context
 
@@ -788,7 +788,7 @@ def test_orphaned_running_review_is_relaunched_without_gateway_restart(
 
     assert len(ctx.subagent_lifecycle.requests) == 1
     request = ctx.subagent_lifecycle.requests[0]
-    assert request.parent_session_id == "s1"
+    assert not hasattr(request, "parent_session_id")
     assert "Pending durable fact" in request.context
 
 
@@ -1106,7 +1106,7 @@ def test_subagent_stop_delivers_notification_to_origin_platform_target(monkeypat
     ]
 
 
-def test_subagent_stop_falls_back_to_callback_if_origin_send_fails(monkeypatch):
+def test_subagent_stop_does_not_use_callback_for_origin_send_failure(monkeypatch):
     plugin = load_plugin()
     ctx = Context()
     notices = []
@@ -1126,7 +1126,7 @@ def test_subagent_stop_falls_back_to_callback_if_origin_send_fails(monkeypatch):
         child_status="completed",
     )
 
-    assert notices == ["📝 Obsidian Review: review complete."]
+    assert notices == []
 
 
 def test_subagent_stop_does_not_crash_if_send_tool_throws_exception(monkeypatch):
@@ -1149,7 +1149,7 @@ def test_subagent_stop_does_not_crash_if_send_tool_throws_exception(monkeypatch)
         child_status="completed",
     )
 
-    assert notices == ["📝 Obsidian Review: review complete."]
+    assert notices == []
 
 
 def test_subagent_stop_updates_lifecycle_state_under_lock():
@@ -2128,7 +2128,7 @@ def test_session_switch_flushes_only_prior_platform_session(
     )
 
     request = ctx.subagent_lifecycle.requests[0]
-    assert request.parent_session_id == "session-a"
+    assert not hasattr(request, "parent_session_id")
     assert "Durable fact from session A" in request.context
     assert "Durable fact from session B" not in request.context
 
@@ -2358,6 +2358,111 @@ def test_legacy_activity_count_is_adopted_by_first_active_session(tmp_path, monk
     assert len(ctx.subagent_lifecycle.requests) == 1
     assert "unknown" not in ctx.state.get("platform_queues")
     assert ctx.state.get("platform_queues")["telegram"]["activity_count"] == 3
+
+
+def test_launch_uses_real_contract_without_parent_and_unique_retry_correlation(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    assert plugin._launch("evidence-session", initial_setup=False)
+    first = ctx.subagent_lifecycle.requests[0]
+    assert isinstance(first, plugin.SubagentLaunchRequest)
+    assert first.parent_session_id is None
+    review_id = ctx.state.get("pending_review")["review_id"]
+    first_correlation = first.correlation_id
+
+    plugin._ACTIVE_CHILD = None
+    pending = dict(ctx.state.get("pending_review"))
+    pending["status"] = "pending"
+    ctx.state.set("pending_review", pending)
+    assert plugin._launch("evidence-session", initial_setup=False)
+    second = ctx.subagent_lifecycle.requests[1]
+    assert second.parent_session_id is None
+    assert second.correlation_id != first_correlation
+    assert ctx.state.get("pending_review")["review_id"] == review_id
+
+
+def test_subagent_start_persists_identity_and_stop_recovers_without_global(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+    assert plugin._launch("s1", initial_setup=False)
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="child-1", child_goal=request.goal)
+    assert ctx.state.get("pending_review")["child_session_id"] == "child-1"
+    plugin._ACTIVE_CHILD = None
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-1", child_status="completed", child_summary="done"
+    )
+    assert ctx.state.get("pending_review") is None
+
+
+def test_setup_rejects_nonfixed_toolsets_and_relative_or_symlink_vault(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    ctx = Context()
+    plugin.register(ctx)
+    args = {
+        "operation": "setup",
+        "vault_path": str(tmp_path),
+        "review_interval": 1,
+        "curator_prompt": "Audit vault.",
+        "allowed_toolsets": ["file", "skills", "terminal"],
+    }
+    assert "allowed_toolsets must be exactly" in json.loads(
+        ctx.tools["obsidian_curator"](args)
+    )["error"]
+    args.pop("allowed_toolsets")
+    args["vault_path"] = "."
+    assert json.loads(ctx.tools["obsidian_curator"](args))["error"] == (
+        "vault_path must be an absolute path."
+    )
+    link = tmp_path.parent / f"{tmp_path.name}-link"
+    link.symlink_to(tmp_path, target_is_directory=True)
+    args["vault_path"] = str(link)
+    assert json.loads(ctx.tools["obsidian_curator"](args))["error"] == (
+        "vault_path must not be a symbolic link."
+    )
+
+
+def test_queue_pruning_preserves_all_pending_batch_events():
+    plugin = load_plugin()
+    pending_events = [
+        {"id": f"pending-{i}", "role": "user", "content": str(i)}
+        for i in range(plugin._MAX_QUEUE_EVENTS + 5)
+    ]
+    queue = {
+        "events": pending_events
+        + [{"id": f"new-{i}", "role": "user", "content": str(i)} for i in range(5)],
+        "sealed_batches": [],
+    }
+
+    plugin._prune_queue_preserving_batch_ids(
+        queue, {event["id"] for event in pending_events}
+    )
+
+    assert {event["id"] for event in queue["events"]} == {
+        event["id"] for event in pending_events
+    }
 
 
 def test_post_tool_call_ignores_blocked_tool_events(tmp_path):

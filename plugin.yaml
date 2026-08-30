@@ -1,5 +1,5 @@
 name: obsidian-curator
-version: 0.6.1
+version: 0.6.2
 manifest_version: 1
 
 description: "One full native Hermes background agent whose only task is managing Obsidian."
@@ -36,7 +36,7 @@ config_schema:
     default:
       - file
       - skills
-    description: "Toolsets available to the curator (default: file and skills)."
+    description: "Fixed curator toolsets; only file and skills are accepted."
   blocked_tools:
     type: list
     default: []
