@@ -100,9 +100,9 @@ def _resolve_origin_target(session_id: str, platform: str = "") -> str | None:
         from gateway.session_context import get_session_env
 
         requested = str(platform or "").strip().lower()
-        session_platform = str(
-            get_session_env("HERMES_SESSION_PLATFORM", "") or ""
-        ).strip().lower()
+        session_platform = (
+            str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+        )
         plat = session_platform if requested in _INTERNAL_PLATFORMS else requested
         chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
         thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
@@ -309,7 +309,10 @@ def _bounded_history(history: Any, limit: int | None = None) -> list[dict[str, s
     if limit is not None and limit > 0:
         normalized = normalized[-limit:]
     normalized = normalized[-_MAX_SESSION_MESSAGES:]
-    while normalized and len(json.dumps(normalized, ensure_ascii=False)) > _PENDING_HISTORY_CHAR_CAP:
+    while (
+        normalized
+        and len(json.dumps(normalized, ensure_ascii=False)) > _PENDING_HISTORY_CHAR_CAP
+    ):
         normalized.pop(0)
     return normalized
 
@@ -424,11 +427,19 @@ def _launch(
         elif _ACTIVE_CHILD:
             return False
         reviewed_count = int(ctx.state.get("activity_count", 0) or 0)
-        context_limit = interval * 2 if (batch_ids is not None and len(batch_ids) > 0) or aggregated_history else interval
+        context_limit = (
+            interval * 2
+            if (batch_ids is not None and len(batch_ids) > 0) or aggregated_history
+            else interval
+        )
         history_snapshot = _bounded_history(
             history, limit=context_limit if not initial_setup else None
         )
-        resolved_batch_ids = list(batch_ids) if batch_ids is not None else list(pending.get("batch_ids") or [])
+        resolved_batch_ids = (
+            list(batch_ids)
+            if batch_ids is not None
+            else list(pending.get("batch_ids") or [])
+        )
         pending.update(
             {
                 "review_id": str(pending.get("review_id") or uuid.uuid4()),
@@ -453,9 +464,10 @@ def _launch(
         _LAUNCHING = True
         _ACTIVE_CHILD = "launching"
         current_origin_target = _resolve_origin_target(session_id, platform)
-        _PENDING_ORIGIN_TARGET = str(
-            origin_target or pending.get("origin_target") or ""
-        ) or current_origin_target
+        _PENDING_ORIGIN_TARGET = (
+            str(origin_target or pending.get("origin_target") or "")
+            or current_origin_target
+        )
         _PENDING_NOTIFIER = (
             _notifier()
             if not _PENDING_ORIGIN_TARGET
@@ -604,7 +616,9 @@ def _save_queues(ctx: Any, queues: dict[str, dict[str, Any]]) -> None:
     )
 
 
-def _append_messages(queue: dict[str, Any], session_id: str, event: dict[str, Any]) -> None:
+def _append_messages(
+    queue: dict[str, Any], session_id: str, event: dict[str, Any]
+) -> None:
     events = queue.setdefault("events", [])
     history = event.get("conversation_history")
     if isinstance(history, list) and history:
@@ -616,8 +630,16 @@ def _append_messages(queue: dict[str, Any], session_id: str, event: dict[str, An
             if role in ("user", "assistant") and content:
                 if len(content) > _MESSAGE_CHAR_CAP:
                     content = f"{content[:_MESSAGE_CHAR_CAP]}\n[... truncated ...]"
-                item = {"id": str(uuid.uuid4()), "session_id": session_id, "role": role, "content": content}
-                if not events or any(item[k] != events[-1].get(k) for k in ("session_id", "role", "content")):
+                item = {
+                    "id": str(uuid.uuid4()),
+                    "session_id": session_id,
+                    "role": role,
+                    "content": content,
+                }
+                if not events or any(
+                    item[k] != events[-1].get(k)
+                    for k in ("session_id", "role", "content")
+                ):
                     events.append(item)
     for role, field in (("user", "user_message"), ("assistant", "assistant_response")):
         content = str(event.get(field) or "").strip()
@@ -625,8 +647,15 @@ def _append_messages(queue: dict[str, Any], session_id: str, event: dict[str, An
             continue
         if len(content) > _MESSAGE_CHAR_CAP:
             content = f"{content[:_MESSAGE_CHAR_CAP]}\n[... truncated ...]"
-        item = {"id": str(uuid.uuid4()), "session_id": session_id, "role": role, "content": content}
-        if not events or any(item[k] != events[-1].get(k) for k in ("session_id", "role", "content")):
+        item = {
+            "id": str(uuid.uuid4()),
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+        }
+        if not events or any(
+            item[k] != events[-1].get(k) for k in ("session_id", "role", "content")
+        ):
             events.append(item)
 
 
@@ -665,7 +694,9 @@ def _on_session_finalize(**event: Any) -> None:
         queues = _queues(ctx)
         platform = _platform_key(event, queues)
         queue = queues.get(platform)
-        if queue is not None and _seal_active_session(queue, old_session_id, new_session_id):
+        if queue is not None and _seal_active_session(
+            queue, old_session_id, new_session_id
+        ):
             _save_queues(ctx, queues)
 
 
@@ -690,6 +721,11 @@ def _on_pre_llm_call(**event: Any) -> None:
     if ctx is None:
         return
     session_id = str(event.get("session_id") or "")
+    pending_raw = ctx.state.get("pending_review")
+    pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
+    active_child = _ACTIVE_CHILD or str(pending.get("child_session_id") or "")
+    if session_id and session_id == active_child:
+        return
     user_message = str(event.get("user_message") or "").strip()
     history = event.get("conversation_history")
     if isinstance(history, list) and history:
@@ -699,7 +735,26 @@ def _on_pre_llm_call(**event: Any) -> None:
         with _LOCK:
             queues = _queues(ctx)
             platform = _platform_key(event, queues)
-            queue = queues.setdefault(platform, {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False, "sealed_batches": []})
+            queue = queues.setdefault(
+                platform,
+                {
+                    "active_session_id": session_id,
+                    "activity_count": 0,
+                    "events": [],
+                    "due": False,
+                    "sealed_batches": [],
+                },
+            )
+            queue = queues.setdefault(
+                platform,
+                {
+                    "active_session_id": session_id,
+                    "activity_count": 0,
+                    "events": [],
+                    "due": False,
+                    "sealed_batches": [],
+                },
+            )
             previous = str(queue.get("active_session_id") or "")
             if previous and session_id and previous != session_id:
                 _seal_active_session(queue, previous, session_id)
@@ -717,9 +772,10 @@ def _on_subagent_stop(**event: Any) -> None:
     child_status = str(event.get("child_status") or "failed").lower()
     raw_summary = str(event.get("child_summary") or "").strip()
     normalized_error = " ".join(raw_summary.split())
-    transient = child_status not in ("completed", "success") and _is_transient_limit_error(
-        normalized_error
-    )
+    transient = child_status not in (
+        "completed",
+        "success",
+    ) and _is_transient_limit_error(normalized_error)
 
     with _LOCK:
         ctx = _CTX
@@ -746,15 +802,29 @@ def _on_subagent_stop(**event: Any) -> None:
             if queue is not None and batch_ids:
                 sealed_batches = []
                 for sealed in queue.get("sealed_batches", []):
-                    remaining_events = [e for e in sealed.get("events", []) if e.get("id") not in batch_ids]
+                    remaining_events = [
+                        e
+                        for e in sealed.get("events", [])
+                        if e.get("id") not in batch_ids
+                    ]
                     if remaining_events:
                         sealed["events"] = remaining_events
                         sealed_batches.append(sealed)
                 queue["sealed_batches"] = sealed_batches
-                queue["events"] = [event for event in queue.get("events", []) if event.get("id") not in batch_ids]
+                queue["events"] = [
+                    event
+                    for event in queue.get("events", [])
+                    if event.get("id") not in batch_ids
+                ]
                 if not pending.get("batch_sealed"):
-                    queue["activity_count"] = max(0, int(queue.get("activity_count", 0)) - int(pending.get("reviewed_activity_count", 0)))
-                queue["due"] = bool(queue.get("sealed_batches")) or int(queue.get("activity_count", 0)) >= (_review_interval(ctx) or 20)
+                    queue["activity_count"] = max(
+                        0,
+                        int(queue.get("activity_count", 0))
+                        - int(pending.get("reviewed_activity_count", 0)),
+                    )
+                queue["due"] = bool(queue.get("sealed_batches")) or int(
+                    queue.get("activity_count", 0)
+                ) >= (_review_interval(ctx) or 20)
                 _save_queues(ctx, queues)
             elif queue is not None and pending.get("batch_sealed"):
                 source_session_id = str(pending.get("source_session_id") or "")
@@ -806,7 +876,9 @@ def _on_subagent_stop(**event: Any) -> None:
             pending["next_retry_at"] = time.time() + delay
             ctx.state.set("pending_review", pending)
 
-    summary = re.sub(r"media\s*:", "MEDIA\u200b:", normalized_error, flags=re.IGNORECASE)
+    summary = re.sub(
+        r"media\s*:", "MEDIA\u200b:", normalized_error, flags=re.IGNORECASE
+    )
     summary = summary[:_MAX_SUMMARY_CHARS]
     if transient:
         summary = (
@@ -849,7 +921,10 @@ def _record_activity(event: dict[str, Any], *, source_type: str) -> None:
         return
     session_id = str(event.get("session_id") or "")
     with _LOCK:
-        if session_id and session_id == _ACTIVE_CHILD:
+        pending_raw = ctx.state.get("pending_review")
+        pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
+        active_child = _ACTIVE_CHILD or str(pending.get("child_session_id") or "")
+        if session_id and session_id == active_child:
             return
         settings = _settings(ctx)
         if not settings.get("vault_path", ""):
@@ -863,18 +938,39 @@ def _record_activity(event: dict[str, Any], *, source_type: str) -> None:
             return
         queues = _queues(ctx)
         platform = _platform_key(event, queues)
-        if source_type == "turn" and platform != "unknown" and "unknown" in queues and str(queues["unknown"].get("active_session_id") or "") in ("", session_id):
+        if (
+            source_type == "turn"
+            and platform != "unknown"
+            and "unknown" in queues
+            and str(queues["unknown"].get("active_session_id") or "")
+            in ("", session_id)
+        ):
             prior = queues.pop("unknown")
             current = queues.get(platform)
             if current:
-                current["activity_count"] = int(current.get("activity_count", 0)) + int(prior.get("activity_count", 0))
-                current["events"] = list(prior.get("events", [])) + list(current.get("events", []))
-                current["sealed_batches"] = list(prior.get("sealed_batches", [])) + list(current.get("sealed_batches", []))
+                current["activity_count"] = int(current.get("activity_count", 0)) + int(
+                    prior.get("activity_count", 0)
+                )
+                current["events"] = list(prior.get("events", [])) + list(
+                    current.get("events", [])
+                )
+                current["sealed_batches"] = list(
+                    prior.get("sealed_batches", [])
+                ) + list(current.get("sealed_batches", []))
                 current["due"] = bool(current.get("due") or prior.get("due"))
             else:
                 prior["active_session_id"] = session_id
                 queues[platform] = prior
-        queue = queues.setdefault(platform, {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False, "sealed_batches": []})
+        queue = queues.setdefault(
+            platform,
+            {
+                "active_session_id": session_id,
+                "activity_count": 0,
+                "events": [],
+                "due": False,
+                "sealed_batches": [],
+            },
+        )
         if source_type == "turn":
             previous = str(queue.get("active_session_id") or "")
             if previous and session_id and previous != session_id:
@@ -916,7 +1012,10 @@ def _should_trigger_pending_retry(
 ) -> bool:
     if not isinstance(pending, dict) or pending.get("status") != "retry_wait":
         return False
-    if parent_turn_id and str(pending.get("last_retry_parent_turn_id") or "") == parent_turn_id:
+    if (
+        parent_turn_id
+        and str(pending.get("last_retry_parent_turn_id") or "") == parent_turn_id
+    ):
         return False
 
     failed_model = str(pending.get("failed_model") or "").strip()
@@ -1001,7 +1100,9 @@ def _launch_if_due(event: dict[str, Any]) -> None:
                     str(pending.get("source_session_id") or session_id),
                     initial_setup=bool(pending.get("initial_setup")),
                     conversation_history=pending.get("history_snapshot"),
-                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                    platform=str(
+                        pending.get("platform") or event.get("platform") or ""
+                    ),
                     batch_ids=pending.get("batch_ids"),
                     batch_sealed=bool(pending.get("batch_sealed")),
                 )
@@ -1012,7 +1113,9 @@ def _launch_if_due(event: dict[str, Any]) -> None:
                     str(pending.get("source_session_id") or session_id),
                     initial_setup=bool(pending.get("initial_setup")),
                     conversation_history=pending.get("history_snapshot"),
-                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                    platform=str(
+                        pending.get("platform") or event.get("platform") or ""
+                    ),
                     batch_ids=pending.get("batch_ids"),
                     batch_sealed=bool(pending.get("batch_sealed")),
                 )
@@ -1038,7 +1141,9 @@ def _launch_if_due(event: dict[str, Any]) -> None:
                     str(pending.get("source_session_id") or session_id),
                     initial_setup=bool(pending.get("initial_setup")),
                     conversation_history=pending.get("history_snapshot"),
-                    platform=str(pending.get("platform") or event.get("platform") or ""),
+                    platform=str(
+                        pending.get("platform") or event.get("platform") or ""
+                    ),
                     batch_ids=pending.get("batch_ids"),
                     batch_sealed=bool(pending.get("batch_sealed")),
                 )
@@ -1052,7 +1157,11 @@ def _launch_if_due(event: dict[str, Any]) -> None:
             return
         queues = _queues(ctx)
         platform = _platform_key(event, queues)
-        due_platform = platform if queues.get(platform, {}).get("due") else next((key for key, value in queues.items() if value.get("due")), "")
+        due_platform = (
+            platform
+            if queues.get(platform, {}).get("due")
+            else next((key for key, value in queues.items() if value.get("due")), "")
+        )
         if not due_platform:
             return
         queue = queues[due_platform]
@@ -1061,8 +1170,15 @@ def _launch_if_due(event: dict[str, Any]) -> None:
         batch = list((sealed or {}).get("events") or queue.get("events") or [])
         batch = batch[-interval * 2 :]
         if batch:
-            source_session_id = str((sealed or {}).get("session_id") or batch[-1].get("session_id") or queue.get("active_session_id") or session_id)
-            history = [{"role": item["role"], "content": item["content"]} for item in batch]
+            source_session_id = str(
+                (sealed or {}).get("session_id")
+                or batch[-1].get("session_id")
+                or queue.get("active_session_id")
+                or session_id
+            )
+            history = [
+                {"role": item["role"], "content": item["content"]} for item in batch
+            ]
             batch_ids = [str(item["id"]) for item in batch]
         else:
             source_session_id = str(
@@ -1086,7 +1202,9 @@ def _launch_if_due(event: dict[str, Any]) -> None:
             if isinstance(launched_pending_raw, dict):
                 launched_pending = dict(launched_pending_raw)
                 launched_pending["parent_model_at_launch"] = parent_model
-                launched_pending["reviewed_activity_count"] = int((sealed or {}).get("activity_count", queue.get("activity_count", 0)))
+                launched_pending["reviewed_activity_count"] = int(
+                    (sealed or {}).get("activity_count", queue.get("activity_count", 0))
+                )
                 ctx.state.set("pending_review", launched_pending)
 
 
@@ -1125,10 +1243,14 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
                     }
                 vault_root = vault_path_obj.resolve()
                 args = event.get("args") or {}
-                if not isinstance(args, dict) or not args.get("path") and not (
-                    tool_name == "patch"
-                    and str(args.get("mode") or "replace") == "patch"
-                    and args.get("patch")
+                if (
+                    not isinstance(args, dict)
+                    or not args.get("path")
+                    and not (
+                        tool_name == "patch"
+                        and str(args.get("mode") or "replace") == "patch"
+                        and args.get("patch")
+                    )
                 ):
                     return {
                         "action": "block",
@@ -1138,7 +1260,10 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
                 if isinstance(args.get("path"), str) and args.get("path"):
                     raw_path_arg = str(args["path"])
                     target_paths.append(raw_path_arg)
-                if tool_name == "patch" and str(args.get("mode") or "replace") == "patch":
+                if (
+                    tool_name == "patch"
+                    and str(args.get("mode") or "replace") == "patch"
+                ):
                     import re
 
                     for m in re.finditer(
@@ -1183,17 +1308,29 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
 
 def _on_post_llm_call(**event: Any) -> None:
     session_id = str(event.get("session_id") or "")
+    ctx = _CTX
+    pending_raw = ctx.state.get("pending_review") if ctx is not None else None
+    pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
+    active_child = _ACTIVE_CHILD or str(pending.get("child_session_id") or "")
+    if session_id and session_id == active_child:
+        return
     assistant_response = str(event.get("assistant_response") or "").strip()
     if assistant_response:
-        _update_session_history(session_id, [{"role": "assistant", "content": assistant_response}])
+        _update_session_history(
+            session_id, [{"role": "assistant", "content": assistant_response}]
+        )
         with _LOCK:
-            ctx = _CTX
-            if ctx is not None and session_id != _ACTIVE_CHILD:
+            if ctx is not None:
                 queues = _queues(ctx)
                 platform = _platform_key(event, queues)
                 queue = queues.setdefault(
                     platform,
-                    {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False},
+                    {
+                        "active_session_id": session_id,
+                        "activity_count": 0,
+                        "events": [],
+                        "due": False,
+                    },
                 )
                 origin_target = _resolve_origin_target(session_id, platform)
                 if origin_target:
@@ -1285,18 +1422,24 @@ def _tool(
                 raw_blocked = args.get("blocked_tools")
                 ctx.set_config(
                     "blocked_tools",
-                    [str(t) for t in raw_blocked] if isinstance(raw_blocked, list) else [],
+                    [str(t) for t in raw_blocked]
+                    if isinstance(raw_blocked, list)
+                    else [],
                 )
             if "skills" in args:
                 raw_skills = args.get("skills")
                 ctx.set_config(
                     "skills",
-                    [str(s) for s in raw_skills] if isinstance(raw_skills, list) else [],
+                    [str(s) for s in raw_skills]
+                    if isinstance(raw_skills, list)
+                    else [],
                 )
             if "model" in args:
                 raw_model = str(args.get("model") or "").strip()
                 ctx.set_config("model_override", raw_model or None)
-            if not _launch(session_id, initial_setup=True, conversation_history=history):
+            if not _launch(
+                session_id, initial_setup=True, conversation_history=history
+            ):
                 raise RuntimeError("lifecycle rejected launch")
             return tool_result(ok=True, status="active", vault_path=str(vault))
         except Exception as exc:
@@ -1318,12 +1461,44 @@ def register(ctx: Any) -> None:
             platform = str(pending_legacy.get("platform") or "unknown")
             events = []
             for item in _bounded_history(pending_legacy.get("history_snapshot")):
-                events.append({"id": str(uuid.uuid4()), "session_id": str(pending_legacy.get("source_session_id") or ""), **item})
+                events.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "session_id": str(
+                            pending_legacy.get("source_session_id") or ""
+                        ),
+                        **item,
+                    }
+                )
             pending_legacy["batch_ids"] = [item["id"] for item in events]
             ctx.state.set("pending_review", pending_legacy)
-            _save_queues(ctx, {platform: {"active_session_id": pending_legacy.get("source_session_id", ""), "activity_count": legacy_count, "events": events, "due": True, "sealed_batches": []}})
+            _save_queues(
+                ctx,
+                {
+                    platform: {
+                        "active_session_id": pending_legacy.get(
+                            "source_session_id", ""
+                        ),
+                        "activity_count": legacy_count,
+                        "events": events,
+                        "due": True,
+                        "sealed_batches": [],
+                    }
+                },
+            )
         elif legacy_count > 0:
-            _save_queues(ctx, {"unknown": {"active_session_id": "", "activity_count": legacy_count, "events": [], "due": legacy_count >= (_review_interval(ctx) or 20), "sealed_batches": []}})
+            _save_queues(
+                ctx,
+                {
+                    "unknown": {
+                        "active_session_id": "",
+                        "activity_count": legacy_count,
+                        "events": [],
+                        "due": legacy_count >= (_review_interval(ctx) or 20),
+                        "sealed_batches": [],
+                    }
+                },
+            )
         else:
             _save_queues(ctx, {})
     pending_raw = ctx.state.get("pending_review")
@@ -1334,6 +1509,10 @@ def register(ctx: Any) -> None:
         ):
             pending["status"] = "pending"
             ctx.state.set("pending_review", pending)
+        elif pending.get("status") == "running":
+            child_id = str(pending.get("child_session_id") or "")
+            if child_id:
+                _ACTIVE_CHILD = child_id
         elif pending.get("status") == "failed":
             pending["status"] = "pending"
             ctx.state.set("pending_review", pending)

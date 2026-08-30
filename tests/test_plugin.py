@@ -412,7 +412,7 @@ def test_failure_preserves_activity_count_and_persists_pending_review_on_429(
     # Simulate subagent failing with 429 quota exhaustion.
     ctx.hooks["subagent_stop"](
         child_session_id="curator-child-1",
-        child_summary='API call failed after 3 retries: HTTP 429: [antigravity/gemini-3.7-flash-high] Resource has been exhausted (reset after 5m 0s)',
+        child_summary="API call failed after 3 retries: HTTP 429: [antigravity/gemini-3.7-flash-high] Resource has been exhausted (reset after 5m 0s)",
         child_status="failed",
     )
 
@@ -431,7 +431,9 @@ def test_failure_preserves_activity_count_and_persists_pending_review_on_429(
     assert pending["next_retry_at"] > 0
 
 
-def _pending_retry_state(*, mode="inherit", failed_model="parent/model", retry_at=2_000.0):
+def _pending_retry_state(
+    *, mode="inherit", failed_model="parent/model", retry_at=2_000.0
+):
     return {
         "review_id": "pending-1",
         "source_session_id": "s1",
@@ -697,9 +699,7 @@ def test_failed_pending_review_from_older_version_is_restored_after_restart(
     assert len(ctx.subagent_lifecycle.requests) == 1
 
 
-def test_running_pending_review_is_restored_after_plugin_restart(
-    tmp_path, monkeypatch
-):
+def test_running_pending_review_is_restored_after_plugin_restart(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(
         plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
@@ -792,9 +792,7 @@ def test_orphaned_running_review_is_relaunched_without_gateway_restart(
     assert "Pending durable fact" in request.context
 
 
-def test_running_review_owned_by_live_process_is_not_relaunched(
-    tmp_path, monkeypatch
-):
+def test_running_review_owned_by_live_process_is_not_relaunched(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "_pid_is_alive", lambda pid: pid == 123)
     ctx = Context(
@@ -849,7 +847,9 @@ def test_inherited_failure_uses_parent_model_when_error_omits_model(
         platform="telegram",
     )
     request = ctx.subagent_lifecycle.requests[0]
-    ctx.hooks["subagent_start"](child_session_id="curator-child", child_goal=request.goal)
+    ctx.hooks["subagent_start"](
+        child_session_id="curator-child", child_goal=request.goal
+    )
     ctx.hooks["subagent_stop"](
         child_session_id="curator-child",
         child_summary="API call failed after 3 retries: HTTP 429: quota exhausted",
@@ -1642,7 +1642,9 @@ def test_launch_request_conforms_to_hermes_core_validation(tmp_path):
 
     class RealValidatingLifecycle:
         def launch(self, req):
-            SubagentLifecycleService._validate_request(req, SimpleNamespace(session_id="parent-sess"))
+            SubagentLifecycleService._validate_request(
+                req, SimpleNamespace(session_id="parent-sess")
+            )
             captured_requests.append(req)
             return SimpleNamespace(to_dict=lambda: {"subagent_id": "sa-valid-1"})
 
@@ -2094,9 +2096,7 @@ def test_retry_preserves_original_origin_target_across_sessions(tmp_path, monkey
     assert ctx.state.get("pending_review")["origin_target"] == "telegram:8804634959"
 
 
-def test_session_switch_flushes_only_prior_platform_session(
-    tmp_path, monkeypatch
-):
+def test_session_switch_flushes_only_prior_platform_session(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
     ctx = Context(
@@ -2234,7 +2234,6 @@ def test_reentering_session_a_after_curation_starts_with_clean_queue(
     assert [e["content"] for e in queue["events"]] == active_contents
 
 
-
 def test_running_review_with_terminal_handle_is_restored(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(
@@ -2288,7 +2287,9 @@ def test_setup_rolls_back_config_when_launch_fails(tmp_path, monkeypatch):
         )
     )
 
-    assert result == {"error": "Failed to launch initial curator review: launch unavailable"}
+    assert result == {
+        "error": "Failed to launch initial curator review: launch unavailable"
+    }
     assert ctx.config["vault_path"] == "/old/vault"
     assert ctx.config["review_interval"] == 9
     assert ctx.config["curator_prompt"] == "Old instructions"
@@ -2335,15 +2336,51 @@ def test_stale_launching_state_recovers_after_timeout(tmp_path, monkeypatch):
 def test_platform_queues_do_not_mix(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
 
-    ctx.hooks["pre_llm_call"](session_id="tg-1", platform="telegram", user_message="Telegram fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="tg-1", platform="telegram", assistant_response="Telegram ack", conversation_history=[])
-    ctx.hooks["pre_llm_call"](session_id="dc-1", platform="discord", user_message="Discord fact 1", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="dc-1", platform="discord", assistant_response="Discord ack 1", conversation_history=[])
-    ctx.hooks["pre_llm_call"](session_id="dc-1", platform="discord", user_message="Discord fact 2", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="dc-1", platform="discord", assistant_response="Discord ack 2", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="tg-1",
+        platform="telegram",
+        user_message="Telegram fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="tg-1",
+        platform="telegram",
+        assistant_response="Telegram ack",
+        conversation_history=[],
+    )
+    ctx.hooks["pre_llm_call"](
+        session_id="dc-1",
+        platform="discord",
+        user_message="Discord fact 1",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="dc-1",
+        platform="discord",
+        assistant_response="Discord ack 1",
+        conversation_history=[],
+    )
+    ctx.hooks["pre_llm_call"](
+        session_id="dc-1",
+        platform="discord",
+        user_message="Discord fact 2",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="dc-1",
+        platform="discord",
+        assistant_response="Discord ack 2",
+        conversation_history=[],
+    )
 
     request = ctx.subagent_lifecycle.requests[0]
     assert "Discord fact 1" in request.context
@@ -2353,16 +2390,48 @@ def test_platform_queues_do_not_mix(tmp_path, monkeypatch):
 def test_success_removes_only_reviewed_plugin_events(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
 
-    ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message="Reviewed fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response="Reviewed ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="s1",
+        platform="telegram",
+        user_message="Reviewed fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        platform="telegram",
+        assistant_response="Reviewed ack",
+        conversation_history=[],
+    )
     request = ctx.subagent_lifecycle.requests[0]
-    ctx.hooks["subagent_start"](child_session_id="child-review", child_goal=request.goal)
-    ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message="New fact during review", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response="New ack", conversation_history=[])
-    ctx.hooks["subagent_stop"](child_session_id="child-review", child_status="completed", child_summary="Obsidian: done")
+    ctx.hooks["subagent_start"](
+        child_session_id="child-review", child_goal=request.goal
+    )
+    ctx.hooks["pre_llm_call"](
+        session_id="s1",
+        platform="telegram",
+        user_message="New fact during review",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        platform="telegram",
+        assistant_response="New ack",
+        conversation_history=[],
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-review",
+        child_status="completed",
+        child_summary="Obsidian: done",
+    )
 
     queue = ctx.state.get("platform_queues")["telegram"]
     contents = [event["content"] for event in queue["events"]]
@@ -2375,30 +2444,74 @@ def test_success_removes_only_reviewed_plugin_events(tmp_path, monkeypatch):
 def test_failed_review_keeps_platform_batch(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
 
-    ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message="Must survive failure", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response="Ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="s1",
+        platform="telegram",
+        user_message="Must survive failure",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="s1",
+        platform="telegram",
+        assistant_response="Ack",
+        conversation_history=[],
+    )
     request = ctx.subagent_lifecycle.requests[0]
-    ctx.hooks["subagent_start"](child_session_id="child-failed", child_goal=request.goal)
-    ctx.hooks["subagent_stop"](child_session_id="child-failed", child_status="failed", child_summary="provider unavailable")
+    ctx.hooks["subagent_start"](
+        child_session_id="child-failed", child_goal=request.goal
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-failed",
+        child_status="failed",
+        child_summary="provider unavailable",
+    )
 
-    contents = [event["content"] for event in ctx.state.get("platform_queues")["telegram"]["events"]]
+    contents = [
+        event["content"]
+        for event in ctx.state.get("platform_queues")["telegram"]["events"]
+    ]
     assert "Must survive failure" in contents
     assert ctx.state.get("pending_review")["status"] == "retry_wait"
 
 
 def test_platform_queue_survives_plugin_reload(tmp_path):
     first = load_plugin()
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 20,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     first.register(ctx)
-    first._on_pre_llm_call(session_id="s1", platform="telegram", user_message="Durable queued fact", conversation_history=[])
-    first._on_post_llm_call(session_id="s1", platform="telegram", assistant_response="Ack", conversation_history=[])
+    first._on_pre_llm_call(
+        session_id="s1",
+        platform="telegram",
+        user_message="Durable queued fact",
+        conversation_history=[],
+    )
+    first._on_post_llm_call(
+        session_id="s1",
+        platform="telegram",
+        assistant_response="Ack",
+        conversation_history=[],
+    )
 
     second = load_plugin()
     second.register(ctx)
-    contents = [event["content"] for event in ctx.state.get("platform_queues")["telegram"]["events"]]
+    contents = [
+        event["content"]
+        for event in ctx.state.get("platform_queues")["telegram"]["events"]
+    ]
     assert "Durable queued fact" in contents
 
 
@@ -2416,11 +2529,27 @@ def test_whatsapp_new_seals_old_batch_and_launches_it_on_next_turn(
         "_resolve_origin_target",
         lambda session_id, platform="": targets.get(session_id),
     )
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 20,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
 
-    ctx.hooks["pre_llm_call"](session_id="session-a", platform="whatsapp", user_message="Old fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="session-a", platform="whatsapp", assistant_response="Old ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="session-a",
+        platform="whatsapp",
+        user_message="Old fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-a",
+        platform="whatsapp",
+        assistant_response="Old ack",
+        conversation_history=[],
+    )
     ctx.hooks["on_session_finalize"](
         session_id="session-a",
         old_session_id="session-a",
@@ -2436,8 +2565,18 @@ def test_whatsapp_new_seals_old_batch_and_launches_it_on_next_turn(
     assert queue["sealed_batches"][0]["origin_target"] == "whatsapp:111"
     assert not ctx.subagent_lifecycle.requests
 
-    ctx.hooks["pre_llm_call"](session_id="session-b", platform="whatsapp", user_message="New fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="session-b", platform="whatsapp", assistant_response="New ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="session-b",
+        platform="whatsapp",
+        user_message="New fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-b",
+        platform="whatsapp",
+        assistant_response="New ack",
+        conversation_history=[],
+    )
 
     assert len(ctx.subagent_lifecycle.requests) == 1
     request = ctx.subagent_lifecycle.requests[0]
@@ -2455,20 +2594,54 @@ def test_session_switch_b_to_a_seals_symmetrically(tmp_path, monkeypatch):
         "_resolve_origin_target",
         lambda session_id, platform="": f"whatsapp:{session_id}",
     )
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 20,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
 
-    ctx.hooks["pre_llm_call"](session_id="session-b", platform="whatsapp", user_message="B fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="session-b", platform="whatsapp", assistant_response="B ack", conversation_history=[])
-    ctx.hooks["on_session_finalize"](old_session_id="session-b", new_session_id="session-a", session_id="session-b", platform="whatsapp", reason="switch")
-    ctx.hooks["on_session_reset"](session_id="session-a", new_session_id="session-a", platform="whatsapp")
+    ctx.hooks["pre_llm_call"](
+        session_id="session-b",
+        platform="whatsapp",
+        user_message="B fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-b",
+        platform="whatsapp",
+        assistant_response="B ack",
+        conversation_history=[],
+    )
+    ctx.hooks["on_session_finalize"](
+        old_session_id="session-b",
+        new_session_id="session-a",
+        session_id="session-b",
+        platform="whatsapp",
+        reason="switch",
+    )
+    ctx.hooks["on_session_reset"](
+        session_id="session-a", new_session_id="session-a", platform="whatsapp"
+    )
 
     queue = ctx.state.get("platform_queues")["whatsapp"]
     assert len(queue["sealed_batches"]) == 1
     assert queue["sealed_batches"][0]["session_id"] == "session-b"
     assert queue["sealed_batches"][0]["origin_target"] == "whatsapp:session-b"
-    ctx.hooks["pre_llm_call"](session_id="session-a", platform="whatsapp", user_message="A fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="session-a", platform="whatsapp", assistant_response="A ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="session-a",
+        platform="whatsapp",
+        user_message="A fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-a",
+        platform="whatsapp",
+        assistant_response="A ack",
+        conversation_history=[],
+    )
     assert len(ctx.subagent_lifecycle.requests) == 1
     assert "B fact" in ctx.subagent_lifecycle.requests[0].context
     assert "A fact" not in ctx.subagent_lifecycle.requests[0].context
@@ -2477,21 +2650,57 @@ def test_session_switch_b_to_a_seals_symmetrically(tmp_path, monkeypatch):
 def test_sealed_batch_success_preserves_new_session_count(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 20,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
-    ctx.hooks["pre_llm_call"](session_id="old", platform="telegram", user_message="Old fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="old", platform="telegram", assistant_response="Old ack", conversation_history=[])
-    ctx.hooks["pre_llm_call"](session_id="new", platform="telegram", user_message="New fact", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="new", platform="telegram", assistant_response="New ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="old",
+        platform="telegram",
+        user_message="Old fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="old",
+        platform="telegram",
+        assistant_response="Old ack",
+        conversation_history=[],
+    )
+    ctx.hooks["pre_llm_call"](
+        session_id="new",
+        platform="telegram",
+        user_message="New fact",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="new",
+        platform="telegram",
+        assistant_response="New ack",
+        conversation_history=[],
+    )
     request = ctx.subagent_lifecycle.requests[0]
-    ctx.hooks["subagent_start"](child_session_id="child-sealed", child_goal=request.goal)
-    ctx.hooks["subagent_stop"](child_session_id="child-sealed", child_status="completed", child_summary="done")
+    ctx.hooks["subagent_start"](
+        child_session_id="child-sealed", child_goal=request.goal
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-sealed", child_status="completed", child_summary="done"
+    )
     assert ctx.state.get("platform_queues")["telegram"]["activity_count"] == 1
 
 
 def test_legacy_activity_count_migrates_without_pending_history(tmp_path):
     plugin = load_plugin()
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 20,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     ctx.state.set("activity_count", 3)
     plugin.register(ctx)
     assert ctx.state.get("platform_queues")["unknown"]["activity_count"] == 3
@@ -2501,16 +2710,34 @@ def test_legacy_activity_count_migrates_without_pending_history(tmp_path):
 def test_large_queue_deletes_only_delivered_batch_events(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     plugin.register(ctx)
 
     for i in range(5):
-        ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message=f"Turn {i} fact", conversation_history=[])
-        ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response=f"Turn {i} ack", conversation_history=[])
+        ctx.hooks["pre_llm_call"](
+            session_id="s1",
+            platform="telegram",
+            user_message=f"Turn {i} fact",
+            conversation_history=[],
+        )
+        ctx.hooks["post_llm_call"](
+            session_id="s1",
+            platform="telegram",
+            assistant_response=f"Turn {i} ack",
+            conversation_history=[],
+        )
 
     request = ctx.subagent_lifecycle.requests[0]
     ctx.hooks["subagent_start"](child_session_id="child-large", child_goal=request.goal)
-    ctx.hooks["subagent_stop"](child_session_id="child-large", child_status="completed", child_summary="done")
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-large", child_status="completed", child_summary="done"
+    )
 
     queue = ctx.state.get("platform_queues")["telegram"]
     remaining_contents = [e["content"] for e in queue["events"]]
@@ -2519,15 +2746,33 @@ def test_large_queue_deletes_only_delivered_batch_events(tmp_path, monkeypatch):
     assert "Turn 4 fact" in remaining_contents
 
 
-def test_legacy_activity_count_is_adopted_by_first_active_session(tmp_path, monkeypatch):
+def test_legacy_activity_count_is_adopted_by_first_active_session(
+    tmp_path, monkeypatch
+):
     plugin = load_plugin()
     monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
-    ctx = Context({"vault_path": str(tmp_path), "review_interval": 3, "curator_prompt": "Audit vault."})
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 3,
+            "curator_prompt": "Audit vault.",
+        }
+    )
     ctx.state.set("activity_count", 2)
     plugin.register(ctx)
 
-    ctx.hooks["pre_llm_call"](session_id="sess-first", platform="telegram", user_message="Fact 1", conversation_history=[])
-    ctx.hooks["post_llm_call"](session_id="sess-first", platform="telegram", assistant_response="Ack 1", conversation_history=[])
+    ctx.hooks["pre_llm_call"](
+        session_id="sess-first",
+        platform="telegram",
+        user_message="Fact 1",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="sess-first",
+        platform="telegram",
+        assistant_response="Ack 1",
+        conversation_history=[],
+    )
 
     assert len(ctx.subagent_lifecycle.requests) == 1
     assert "unknown" not in ctx.state.get("platform_queues")
@@ -2602,9 +2847,10 @@ def test_setup_rejects_nonfixed_toolsets_and_relative_or_symlink_vault(
         "curator_prompt": "Audit vault.",
         "allowed_toolsets": ["file", "skills", "terminal"],
     }
-    assert "allowed_toolsets must be exactly" in json.loads(
-        ctx.tools["obsidian_curator"](args)
-    )["error"]
+    assert (
+        "allowed_toolsets must be exactly"
+        in json.loads(ctx.tools["obsidian_curator"](args))["error"]
+    )
     args.pop("allowed_toolsets")
     args["vault_path"] = "."
     assert json.loads(ctx.tools["obsidian_curator"](args))["error"] == (
@@ -2664,3 +2910,43 @@ def test_post_tool_call_ignores_blocked_tool_events(tmp_path):
         status="ok",
     )
     assert ctx.state.get("activity_count", 0) == 1
+
+
+def test_child_session_events_are_completely_ignored_across_all_hooks(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    ctx.state.set(
+        "pending_review", {"status": "running", "child_session_id": "child-curator-99"}
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](
+        session_id="child-curator-99",
+        user_message="internal prompt",
+        conversation_history=[],
+        platform="subagent",
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="child-curator-99",
+        assistant_response="done note",
+        conversation_history=[],
+        platform="subagent",
+    )
+    ctx.hooks["post_tool_call"](
+        session_id="child-curator-99",
+        tool_name="write_file",
+        status="ok",
+    )
+
+    queues = ctx.state.get("platform_queues", {})
+    assert "subagent" not in queues or not queues["subagent"].get("events")
+    assert ctx.state.get("activity_count", 0) == 0
