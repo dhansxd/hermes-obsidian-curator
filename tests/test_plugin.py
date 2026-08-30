@@ -194,6 +194,32 @@ def test_switch_without_activity_does_not_flush_other_session(tmp_path, monkeypa
     assert ctx.state.get("session_activity_counts") == {"session-b": 1}
 
 
+def test_shutdown_or_exit_finalize_does_not_flush_session(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](session_id="session-a", assistant_response="A activity", platform="telegram")
+    assert ctx.state.get("session_activity_counts") == {"session-a": 1}
+
+    ctx.hooks["on_session_finalize"](session_id="session-a", reason="shutdown", platform="telegram")
+    ctx.hooks["on_session_finalize"](session_id="session-a", reason="process_exit", platform="telegram")
+
+    assert not calls
+    assert ctx.state.get("session_activity_counts") == {"session-a": 1}
+
+
+def test_format_summary_extracts_final_marker_and_strips_preamble():
+    plugin = load_plugin()
+    raw = (
+        "Now I have a solid picture. Let me analyze candidate evidence.\n"
+        "📝 Obsidian Review: Updated Mac to Dyra2 wired guide.\n"
+        "Extra noise."
+    )
+    assert plugin._format_summary(raw) == "📝 Obsidian Review: Updated Mac to Dyra2 wired guide. Extra noise."
+
+
 def test_due_sessions_are_queued_and_run_sequentially(tmp_path, monkeypatch):
     plugin = load_plugin()
     calls = install_cron_mock(monkeypatch)

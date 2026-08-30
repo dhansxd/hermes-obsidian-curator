@@ -205,7 +205,11 @@ def _review_interval(ctx: Any) -> int | None:
 
 
 def _format_summary(raw: str, default: str = "curation completed.") -> str:
-    summary = " ".join(str(raw or "").split())
+    text = str(raw or "").strip()
+    match = re.search(r"(?:📝\s*)?Obsidian(?:\s+Review)?\s*:\s*(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
+    if match:
+        text = match.group(1).strip()
+    summary = " ".join(text.split())
     summary = re.sub(r"media\s*:", "MEDIA\u200b:", summary, flags=re.IGNORECASE)[:_MAX_SUMMARY_CHARS]
     for prefix in ("📝 Obsidian Review:", "Obsidian Review:", "Obsidian:"):
         if summary.startswith(prefix):
@@ -489,6 +493,8 @@ def _flush_session(event: dict[str, Any]) -> None:
 
 
 def _on_session_finalize(**event: Any) -> None:
+    if str(event.get("reason") or "").lower() in {"shutdown", "process_exit"}:
+        return
     _flush_session(event)
 
 
