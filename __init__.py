@@ -660,9 +660,6 @@ def _on_pre_llm_call(**event: Any) -> None:
                 queue["due"] = True
             queue["active_session_id"] = session_id or previous
             queue["origin_target"] = _resolve_origin_target(session_id, platform)
-            history = event.get("conversation_history")
-            if isinstance(history, list) and history and not queue.get("events"):
-                _append_messages(queue, session_id, {"conversation_history": history})
             _append_messages(queue, session_id, {"user_message": user_message})
             _save_queues(ctx, queues)
 
@@ -1131,7 +1128,11 @@ def _on_post_llm_call(**event: Any) -> None:
                     platform,
                     {"active_session_id": session_id, "activity_count": 0, "events": [], "due": False},
                 )
-                _append_messages(queue, session_id, event)
+                _append_messages(
+                    queue,
+                    session_id,
+                    {"assistant_response": assistant_response},
+                )
                 _save_queues(ctx, queues)
     _record_activity(event, source_type="turn")
     _launch_if_due(event)

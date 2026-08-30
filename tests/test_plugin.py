@@ -2133,6 +2133,88 @@ def test_session_switch_flushes_only_prior_platform_session(
     assert "Durable fact from session B" not in request.context
 
 
+def test_reentering_session_a_after_curation_starts_with_clean_queue(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 10,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    # 1. Turn di session A (belum capai 10 turn)
+    ctx.hooks["pre_llm_call"](
+        session_id="session-a",
+        platform="telegram",
+        user_message="Pesan lama di A",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-a",
+        platform="telegram",
+        assistant_response="Jawaban lama di A",
+        conversation_history=[],
+    )
+
+    # 2. Pindah ke session B -> A disegel dan langsung dikurasi di turn B
+    ctx.hooks["pre_llm_call"](
+        session_id="session-b",
+        platform="telegram",
+        user_message="Halo dari B",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-b",
+        platform="telegram",
+        assistant_response="Jawaban di B",
+        conversation_history=[],
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    req = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="child-curate-a", child_goal=req.goal)
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-curate-a",
+        child_status="completed",
+        child_summary="Curated session A",
+    )
+
+    # 3. Kembali ke session A dengan full history lama di parameter conversation_history
+    full_history_a = [
+        {"role": "user", "content": "Pesan lama di A"},
+        {"role": "assistant", "content": "Jawaban lama di A"},
+    ]
+    ctx.hooks["pre_llm_call"](
+        session_id="session-a",
+        platform="telegram",
+        user_message="Pesan baru setelah balik ke A",
+        conversation_history=full_history_a,
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-a",
+        platform="telegram",
+        assistant_response="Jawaban baru di A",
+        conversation_history=full_history_a,
+    )
+
+    queue = ctx.state.get("platform_queues")["telegram"]
+    # Antrean aktif di A hanya memuat pesan baru, B yang baru disegel masuk sealed_batches
+    active_contents = [e["content"] for e in queue["events"]]
+    assert "Pesan lama di A" not in active_contents
+    assert "Jawaban lama di A" not in active_contents
+    assert active_contents == [
+        "Pesan baru setelah balik ke A",
+        "Jawaban baru di A",
+    ]
+    assert queue["activity_count"] == 1
+
+
+
 def test_running_review_with_terminal_handle_is_restored(tmp_path, monkeypatch):
     plugin = load_plugin()
     monkeypatch.setattr(
