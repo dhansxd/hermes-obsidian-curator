@@ -2202,8 +2202,14 @@ def test_reentering_session_a_after_curation_starts_with_clean_queue(
         conversation_history=full_history_a,
     )
 
+    assert len(ctx.subagent_lifecycle.requests) == 2
+    req_b = ctx.subagent_lifecycle.requests[1]
+    assert "Halo dari B" in req_b.context
+    assert "Jawaban di B" in req_b.context
+    assert "Pesan lama di A" not in req_b.context
+    assert "Pesan baru setelah balik ke A" not in req_b.context
+
     queue = ctx.state.get("platform_queues")["telegram"]
-    # Antrean aktif di A hanya memuat pesan baru, B yang baru disegel masuk sealed_batches
     active_contents = [e["content"] for e in queue["events"]]
     assert "Pesan lama di A" not in active_contents
     assert "Jawaban lama di A" not in active_contents
@@ -2212,6 +2218,18 @@ def test_reentering_session_a_after_curation_starts_with_clean_queue(
         "Jawaban baru di A",
     ]
     assert queue["activity_count"] == 1
+
+    ctx.hooks["subagent_start"](
+        child_session_id="child-curate-b", child_goal=req_b.goal
+    )
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-curate-b",
+        child_status="completed",
+        child_summary="Curated session B",
+    )
+    queue = ctx.state.get("platform_queues")["telegram"]
+    assert queue["sealed_batches"] == []
+    assert [e["content"] for e in queue["events"]] == active_contents
 
 
 
