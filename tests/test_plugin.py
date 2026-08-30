@@ -480,7 +480,7 @@ def test_inherited_model_retries_after_successful_same_model_turn(
     request = ctx.subagent_lifecycle.requests[0]
     assert request.model is None
     assert "Pending durable fact" in request.context
-    assert "Main agent recovered" in request.context
+    assert "Main agent recovered" not in request.context
 
     # Same signal cannot create another child.
     ctx.hooks["post_llm_call"](**event)
@@ -788,7 +788,7 @@ def test_orphaned_running_review_is_relaunched_without_gateway_restart(
 
     assert len(ctx.subagent_lifecycle.requests) == 1
     request = ctx.subagent_lifecycle.requests[0]
-    assert request.parent_session_id == "current-session"
+    assert request.parent_session_id == "s1"
     assert "Pending durable fact" in request.context
 
 
@@ -1579,13 +1579,13 @@ def test_session_history_cache_captures_exact_recent_messages_for_interval(
     assert len(ctx.subagent_lifecycle.requests) == 1
     req = ctx.subagent_lifecycle.requests[0]
     assert req.context is not None
-    assert "Turn 1: Decision on architecture." not in req.context
-    assert "Turn 2: Research findings." not in req.context
+    assert "Turn 1: Decision on architecture." in req.context
+    assert "Turn 2: Research findings." in req.context
     assert "Turn 2 ack." in req.context
     assert "Turn 3: Project state changed to active." in req.context
     assert "Turn 3 ack." in req.context
-    assert req.context.count("\nuser:") + req.context.startswith("user:") == 1
-    assert req.context.count("\nassistant:") == 2
+    assert req.context.count("user:") == 3
+    assert req.context.count("assistant:") == 3
 
 
 def test_initial_mapping_prompt_is_universal_without_hardcoded_file_names(
@@ -2052,7 +2052,7 @@ def test_retry_preserves_original_origin_target_across_sessions(tmp_path, monkey
     assert ctx.state.get("pending_review")["origin_target"] == "telegram:8804634959"
 
 
-def test_periodic_review_includes_counted_activity_from_multiple_sessions(
+def test_session_switch_flushes_only_prior_platform_session(
     tmp_path, monkeypatch
 ):
     plugin = load_plugin()
@@ -2088,8 +2088,9 @@ def test_periodic_review_includes_counted_activity_from_multiple_sessions(
     )
 
     request = ctx.subagent_lifecycle.requests[0]
+    assert request.parent_session_id == "session-a"
     assert "Durable fact from session A" in request.context
-    assert "Durable fact from session B" in request.context
+    assert "Durable fact from session B" not in request.context
 
 
 def test_running_review_with_terminal_handle_is_restored(tmp_path, monkeypatch):
@@ -2187,6 +2188,136 @@ def test_stale_launching_state_recovers_after_timeout(tmp_path, monkeypatch):
 
     assert len(ctx.subagent_lifecycle.requests) == 1
     assert getattr(plugin, "_ACTIVE_CHILD") == "launching"
+
+
+def test_platform_queues_do_not_mix(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 2, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](session_id="tg-1", platform="telegram", user_message="Telegram fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="tg-1", platform="telegram", assistant_response="Telegram ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](session_id="dc-1", platform="discord", user_message="Discord fact 1", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="dc-1", platform="discord", assistant_response="Discord ack 1", conversation_history=[])
+    ctx.hooks["pre_llm_call"](session_id="dc-1", platform="discord", user_message="Discord fact 2", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="dc-1", platform="discord", assistant_response="Discord ack 2", conversation_history=[])
+
+    request = ctx.subagent_lifecycle.requests[0]
+    assert "Discord fact 1" in request.context
+    assert "Telegram fact" not in request.context
+
+
+def test_success_removes_only_reviewed_plugin_events(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message="Reviewed fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response="Reviewed ack", conversation_history=[])
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="child-review", child_goal=request.goal)
+    ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message="New fact during review", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response="New ack", conversation_history=[])
+    ctx.hooks["subagent_stop"](child_session_id="child-review", child_status="completed", child_summary="Obsidian: done")
+
+    queue = ctx.state.get("platform_queues")["telegram"]
+    contents = [event["content"] for event in queue["events"]]
+    assert "Reviewed fact" not in contents
+    assert "Reviewed ack" not in contents
+    assert "New fact during review" in contents
+    assert "New ack" in contents
+
+
+def test_failed_review_keeps_platform_batch(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message="Must survive failure", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response="Ack", conversation_history=[])
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="child-failed", child_goal=request.goal)
+    ctx.hooks["subagent_stop"](child_session_id="child-failed", child_status="failed", child_summary="provider unavailable")
+
+    contents = [event["content"] for event in ctx.state.get("platform_queues")["telegram"]["events"]]
+    assert "Must survive failure" in contents
+    assert ctx.state.get("pending_review")["status"] == "retry_wait"
+
+
+def test_platform_queue_survives_plugin_reload(tmp_path):
+    first = load_plugin()
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    first.register(ctx)
+    first._on_pre_llm_call(session_id="s1", platform="telegram", user_message="Durable queued fact", conversation_history=[])
+    first._on_post_llm_call(session_id="s1", platform="telegram", assistant_response="Ack", conversation_history=[])
+
+    second = load_plugin()
+    second.register(ctx)
+    contents = [event["content"] for event in ctx.state.get("platform_queues")["telegram"]["events"]]
+    assert "Durable queued fact" in contents
+
+
+def test_sealed_batch_success_preserves_new_session_count(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+    ctx.hooks["pre_llm_call"](session_id="old", platform="telegram", user_message="Old fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="old", platform="telegram", assistant_response="Old ack", conversation_history=[])
+    ctx.hooks["pre_llm_call"](session_id="new", platform="telegram", user_message="New fact", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="new", platform="telegram", assistant_response="New ack", conversation_history=[])
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="child-sealed", child_goal=request.goal)
+    ctx.hooks["subagent_stop"](child_session_id="child-sealed", child_status="completed", child_summary="done")
+    assert ctx.state.get("platform_queues")["telegram"]["activity_count"] == 1
+
+
+def test_legacy_activity_count_migrates_without_pending_history(tmp_path):
+    plugin = load_plugin()
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx.state.set("activity_count", 3)
+    plugin.register(ctx)
+    assert ctx.state.get("platform_queues")["unknown"]["activity_count"] == 3
+    assert ctx.state.get("activity_count") == 3
+
+
+def test_large_queue_deletes_only_delivered_batch_events(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    for i in range(5):
+        ctx.hooks["pre_llm_call"](session_id="s1", platform="telegram", user_message=f"Turn {i} fact", conversation_history=[])
+        ctx.hooks["post_llm_call"](session_id="s1", platform="telegram", assistant_response=f"Turn {i} ack", conversation_history=[])
+
+    request = ctx.subagent_lifecycle.requests[0]
+    ctx.hooks["subagent_start"](child_session_id="child-large", child_goal=request.goal)
+    ctx.hooks["subagent_stop"](child_session_id="child-large", child_status="completed", child_summary="done")
+
+    queue = ctx.state.get("platform_queues")["telegram"]
+    remaining_contents = [e["content"] for e in queue["events"]]
+    assert len(remaining_contents) > 0
+    assert "Turn 0 fact" not in remaining_contents
+    assert "Turn 4 fact" in remaining_contents
+
+
+def test_legacy_activity_count_is_adopted_by_first_active_session(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 3, "curator_prompt": "Audit vault."})
+    ctx.state.set("activity_count", 2)
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](session_id="sess-first", platform="telegram", user_message="Fact 1", conversation_history=[])
+    ctx.hooks["post_llm_call"](session_id="sess-first", platform="telegram", assistant_response="Ack 1", conversation_history=[])
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert "unknown" not in ctx.state.get("platform_queues")
+    assert ctx.state.get("platform_queues")["telegram"]["activity_count"] == 3
 
 
 def test_post_tool_call_ignores_blocked_tool_events(tmp_path):

@@ -1,6 +1,7 @@
 name: obsidian-curator
-version: 0.5.5
+version: 0.6.0
 manifest_version: 1
+
 description: "One full native Hermes background agent whose only task is managing Obsidian."
 author: Dani & Dyra
 provides_tools:
