@@ -11,7 +11,12 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
-from agent.subagent_lifecycle import SubagentLaunchRequest, get_active_subagent_parent
+from agent.subagent_lifecycle import (
+    SubagentHandle,
+    SubagentLaunchRequest,
+    SubagentState,
+    get_active_subagent_parent,
+)
 from tools.registry import tool_error, tool_result
 
 _MARKER = "OBSIDIAN_CURATOR_BACKGROUND_AGENT"
@@ -31,6 +36,7 @@ _parent_review_callback: Callable[[str], Any] | None = None
 _DEFAULT_TOOLSETS = ("file", "skills")
 _ALWAYS_BLOCKED_TOOLS = ("delegate_task", "skill_manage")
 _DEFAULT_RETRY_SECONDS = 5 * 60 * 60
+_LAUNCH_TIMEOUT_SECONDS = 60
 _PENDING_HISTORY_CHAR_CAP = 28_000
 _INTERNAL_PLATFORMS = {"", "cli", "cron", "desktop", "local", "subagent"}
 
@@ -53,6 +59,34 @@ def _pid_is_alive(pid: Any) -> bool:
         return True
     except (OSError, TypeError, ValueError):
         return False
+
+
+def _child_handle_is_alive(ctx: Any, pending: dict[str, Any]) -> bool:
+    handle_dict = pending.get("handle")
+    if isinstance(handle_dict, dict) and ctx is not None:
+        try:
+            lifecycle = getattr(ctx, "subagent_lifecycle", None)
+            if lifecycle and hasattr(lifecycle, "status"):
+                handle = SubagentHandle.from_dict(handle_dict)
+                status = lifecycle.status(handle)
+                state = getattr(status, "state", None)
+                if state in (
+                    SubagentState.PENDING,
+                    SubagentState.STARTING,
+                    SubagentState.RUNNING,
+                ):
+                    return True
+                if state in (
+                    SubagentState.SUCCEEDED,
+                    SubagentState.FAILED,
+                    SubagentState.CANCELLED,
+                    SubagentState.INTERRUPTED,
+                    SubagentState.UNKNOWN,
+                ):
+                    return False
+        except Exception:
+            pass
+    return _pid_is_alive(pending.get("owner_pid"))
 
 
 def _resolve_origin_target(session_id: str, platform: str = "") -> str | None:
@@ -239,6 +273,17 @@ def _update_session_history(
             _SESSION_HISTORIES[session_id] = existing[-_MAX_SESSION_MESSAGES:]
 
 
+def _all_session_history(limit: int) -> list[dict[str, str]]:
+    with _LOCK:
+        histories = [list(history) for history in _SESSION_HISTORIES.values()]
+    if not histories:
+        return []
+    per_session = max(1, limit // len(histories))
+    return _bounded_history(
+        [message for history in histories for message in history[-per_session:]]
+    )
+
+
 def _bounded_history(history: Any, limit: int | None = None) -> list[dict[str, str]]:
     if not isinstance(history, list):
         return []
@@ -308,6 +353,12 @@ def _launch(
     if ctx is None:
         return False
     history = conversation_history
+    with _LOCK:
+        session_count = len(_SESSION_HISTORIES)
+    aggregated_history = history is None and not initial_setup and session_count > 1
+    if history is None and not initial_setup:
+        interval = _review_interval(ctx) or 20
+        history = _all_session_history(interval * 2 if aggregated_history else interval)
     if history is None and session_id:
         with _LOCK:
             history = list(_SESSION_HISTORIES.get(session_id, []))
@@ -349,14 +400,24 @@ def _launch(
         model_override = str(model_override).strip() or None
 
     with _LOCK:
-        if _LAUNCHING or _ACTIVE_CHILD:
-            return False
-        reviewed_count = int(ctx.state.get("activity_count", 0) or 0)
-        history_snapshot = _bounded_history(
-            history, limit=interval if not initial_setup else None
-        )
+        now = time.time()
         existing_pending = ctx.state.get("pending_review")
         pending = dict(existing_pending) if isinstance(existing_pending, dict) else {}
+        if _LAUNCHING:
+            return False
+        if _ACTIVE_CHILD == "launching":
+            launch_time = float(pending.get("launched_at", 0) or 0)
+            if launch_time and now - launch_time > _LAUNCH_TIMEOUT_SECONDS:
+                _ACTIVE_CHILD = None
+            else:
+                return False
+        elif _ACTIVE_CHILD:
+            return False
+        reviewed_count = int(ctx.state.get("activity_count", 0) or 0)
+        context_limit = interval * 2 if aggregated_history else interval
+        history_snapshot = _bounded_history(
+            history, limit=context_limit if not initial_setup else None
+        )
         pending.update(
             {
                 "review_id": str(pending.get("review_id") or uuid.uuid4()),
@@ -372,16 +433,19 @@ def _launch(
                 ),
                 "status": "running",
                 "owner_pid": os.getpid(),
+                "launched_at": now,
             }
         )
         _LAUNCHING = True
         _ACTIVE_CHILD = "launching"
         _PENDING_NOTIFIER = _notifier()
-        _PENDING_ORIGIN_TARGET = _resolve_origin_target(session_id, platform)
+        _PENDING_ORIGIN_TARGET = str(pending.get("origin_target") or "") or (
+            _resolve_origin_target(session_id, platform)
+        )
         pending["origin_target"] = _PENDING_ORIGIN_TARGET
         ctx.state.set("pending_review", pending)
         try:
-            ctx.subagent_lifecycle.launch(
+            handle = ctx.subagent_lifecycle.launch(
                 SubagentLaunchRequest(
                     goal=_prompt(
                         vault,
@@ -391,14 +455,24 @@ def _launch(
                         skills=skills,
                     ),
                     context=_format_context(
-                        history, limit=interval if not initial_setup else None
+                        history, limit=context_limit if not initial_setup else None
                     ),
                     role="leaf",
                     allowed_toolsets=allowed_toolsets,
+                    blocked_tools=tuple(
+                        dict.fromkeys(
+                            _ALWAYS_BLOCKED_TOOLS
+                            + tuple(str(t) for t in (settings.get("blocked_tools") or []))
+                        )
+                    ),
                     model=model_override,
                     parent_session_id=session_id or None,
+                    correlation_id=str(pending["review_id"]),
                 )
             )
+            if hasattr(handle, "to_dict"):
+                pending["handle"] = handle.to_dict()
+                ctx.state.set("pending_review", pending)
             return True
         except Exception:
             _ACTIVE_CHILD = None
@@ -446,10 +520,10 @@ def _on_pre_llm_call(**event: Any) -> None:
 def _on_subagent_stop(**event: Any) -> None:
     global _ACTIVE_CHILD
     child_session_id = str(event.get("child_session_id") or "")
-    child_status = str(event.get("child_status") or "failed")
+    child_status = str(event.get("child_status") or "failed").lower()
     raw_summary = str(event.get("child_summary") or "").strip()
     normalized_error = " ".join(raw_summary.split())
-    transient = child_status != "completed" and _is_transient_limit_error(
+    transient = child_status not in ("completed", "success") and _is_transient_limit_error(
         normalized_error
     )
 
@@ -463,7 +537,7 @@ def _on_subagent_stop(**event: Any) -> None:
         pending_raw = ctx.state.get("pending_review")
         pending = dict(pending_raw) if isinstance(pending_raw, dict) else {}
 
-        if child_status == "completed":
+        if child_status in ("completed", "success"):
             reviewed_count = int(pending.get("reviewed_activity_count", 0) or 0)
             current_count = int(ctx.state.get("activity_count", 0) or 0)
             ctx.state.set("activity_count", max(0, current_count - reviewed_count))
@@ -615,6 +689,7 @@ def _should_trigger_pending_retry(
 
 
 def _launch_if_due(event: dict[str, Any]) -> None:
+    global _ACTIVE_CHILD
     ctx = _CTX
     if ctx is None:
         return
@@ -672,8 +747,18 @@ def _launch_if_due(event: dict[str, Any]) -> None:
                 )
                 return
             if pending.get("status") == "running":
-                owner_pid = pending.get("owner_pid")
-                if _ACTIVE_CHILD or _pid_is_alive(owner_pid):
+                launch_time = float(pending.get("launched_at", 0) or 0)
+                stale_launch = (
+                    _ACTIVE_CHILD == "launching"
+                    and launch_time
+                    and time.time() - launch_time > _LAUNCH_TIMEOUT_SECONDS
+                )
+                if _ACTIVE_CHILD and not stale_launch:
+                    ctx.state.set("pending_review", pending)
+                    return
+                if stale_launch:
+                    _ACTIVE_CHILD = None
+                if _child_handle_is_alive(ctx, pending):
                     ctx.state.set("pending_review", pending)
                     return
                 pending["status"] = "pending"
@@ -738,29 +823,19 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
                     }
                 vault_root = Path(vault_raw).expanduser().resolve()
                 args = event.get("args") or {}
-                if tool_name == "search_files" and not args.get("path"):
+                if not isinstance(args, dict) or not args.get("path") and not (
+                    tool_name == "patch"
+                    and str(args.get("mode") or "replace") == "patch"
+                    and args.get("patch")
+                ):
                     return {
                         "action": "block",
-                        "message": "Tool 'search_files' requires an explicit path inside the designated Obsidian vault.",
+                        "message": f"Tool '{tool_name}' requires an explicit path inside the designated Obsidian vault.",
                     }
                 target_paths: list[str] = []
                 if isinstance(args.get("path"), str) and args.get("path"):
                     raw_path_arg = str(args["path"])
-                    if tool_name == "search_files":
-                        try:
-                            candidate = Path(raw_path_arg).expanduser()
-                            exists = candidate.exists()
-                        except Exception:
-                            exists = False
-                        if exists:
-                            target_paths.append(raw_path_arg)
-                        else:
-                            for chunk in raw_path_arg.split(","):
-                                for segment in chunk.split():
-                                    if segment.strip():
-                                        target_paths.append(segment.strip())
-                    else:
-                        target_paths.append(raw_path_arg)
+                    target_paths.append(raw_path_arg)
                 if tool_name == "patch" and str(args.get("mode") or "replace") == "patch":
                     import re
 
@@ -776,6 +851,11 @@ def _on_pre_tool_call(**event: Any) -> dict[str, str] | None:
                                     target_paths.append(segment.strip())
                         elif header_target:
                             target_paths.append(header_target)
+                    if not target_paths:
+                        return {
+                            "action": "block",
+                            "message": "Tool 'patch' did not provide a valid file target inside the designated Obsidian vault.",
+                        }
                 for raw_target in target_paths:
                     try:
                         target_resolved = Path(raw_target).expanduser().resolve()
@@ -809,6 +889,8 @@ def _on_post_llm_call(**event: Any) -> None:
 
 
 def _on_post_tool_call(**event: Any) -> None:
+    if str(event.get("status") or "ok").lower() == "blocked":
+        return
     _record_activity(event, source_type="tool")
 
 
@@ -851,38 +933,45 @@ def _tool(
             return tool_error(
                 "A background curator review is already active. Please wait for it to finish."
             )
-        ctx.set_config("vault_path", str(vault))
-        ctx.set_config("review_interval", interval)
-        ctx.set_config("curator_prompt", curator_prompt)
-        if "trigger_on_turns" in args:
-            ctx.set_config("trigger_on_turns", bool(args["trigger_on_turns"]))
-        if "trigger_on_tools" in args:
-            ctx.set_config("trigger_on_tools", bool(args["trigger_on_tools"]))
-        if "allowed_toolsets" in args:
-            raw_toolsets = args.get("allowed_toolsets")
-            ctx.set_config(
-                "allowed_toolsets",
-                [str(t) for t in raw_toolsets]
-                if isinstance(raw_toolsets, list)
-                else None,
-            )
-        if "blocked_tools" in args:
-            raw_blocked = args.get("blocked_tools")
-            ctx.set_config(
-                "blocked_tools",
-                [str(t) for t in raw_blocked] if isinstance(raw_blocked, list) else [],
-            )
-        if "skills" in args:
-            raw_skills = args.get("skills")
-            ctx.set_config(
-                "skills",
-                [str(s) for s in raw_skills] if isinstance(raw_skills, list) else [],
-            )
-        if "model" in args:
-            raw_model = str(args.get("model") or "").strip()
-            ctx.set_config("model_override", raw_model or None)
-        _launch(session_id, initial_setup=True, conversation_history=history)
-        return tool_result(ok=True, status="active", vault_path=str(vault))
+        previous_settings = _settings(ctx)
+        try:
+            ctx.set_config("vault_path", str(vault))
+            ctx.set_config("review_interval", interval)
+            ctx.set_config("curator_prompt", curator_prompt)
+            if "trigger_on_turns" in args:
+                ctx.set_config("trigger_on_turns", bool(args["trigger_on_turns"]))
+            if "trigger_on_tools" in args:
+                ctx.set_config("trigger_on_tools", bool(args["trigger_on_tools"]))
+            if "allowed_toolsets" in args:
+                raw_toolsets = args.get("allowed_toolsets")
+                ctx.set_config(
+                    "allowed_toolsets",
+                    [str(t) for t in raw_toolsets]
+                    if isinstance(raw_toolsets, list)
+                    else None,
+                )
+            if "blocked_tools" in args:
+                raw_blocked = args.get("blocked_tools")
+                ctx.set_config(
+                    "blocked_tools",
+                    [str(t) for t in raw_blocked] if isinstance(raw_blocked, list) else [],
+                )
+            if "skills" in args:
+                raw_skills = args.get("skills")
+                ctx.set_config(
+                    "skills",
+                    [str(s) for s in raw_skills] if isinstance(raw_skills, list) else [],
+                )
+            if "model" in args:
+                raw_model = str(args.get("model") or "").strip()
+                ctx.set_config("model_override", raw_model or None)
+            _launch(session_id, initial_setup=True, conversation_history=history)
+            return tool_result(ok=True, status="active", vault_path=str(vault))
+        except Exception as exc:
+            for key, val in previous_settings.items():
+                if val is not None:
+                    ctx.set_config(key, val)
+            return tool_error(f"Failed to launch initial curator review: {exc}")
 
 
 def register(ctx: Any) -> None:
@@ -891,8 +980,8 @@ def register(ctx: Any) -> None:
     pending_raw = ctx.state.get("pending_review")
     if isinstance(pending_raw, dict):
         pending = dict(pending_raw)
-        if pending.get("status") == "running" and not _pid_is_alive(
-            pending.get("owner_pid")
+        if pending.get("status") == "running" and not _child_handle_is_alive(
+            ctx, pending
         ):
             pending["status"] = "pending"
             ctx.state.set("pending_review", pending)

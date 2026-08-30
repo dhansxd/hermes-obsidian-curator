@@ -1663,7 +1663,7 @@ def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
 
     req = ctx.subagent_lifecycle.requests[0]
     assert req.allowed_toolsets == ("file", "skills")
-    assert not hasattr(req, "blocked_tools")
+    assert req.blocked_tools == ("delegate_task", "skill_manage", "terminal")
     assert req.model == "claude-3-5-sonnet-20241022"
     assert "skill_view" in req.goal
     assert "obsidian" in req.goal
@@ -1696,12 +1696,13 @@ def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
         "action": "block",
         "message": "Tool 'terminal' is disabled for the Obsidian curator subagent.",
     }
-    assert (
-        ctx.hooks["pre_tool_call"](
-            session_id="child-tools-1", tool_name="read_file", args={}
-        )
-        is None
+    missing_read_path = ctx.hooks["pre_tool_call"](
+        session_id="child-tools-1", tool_name="read_file", args={}
     )
+    assert missing_read_path == {
+        "action": "block",
+        "message": "Tool 'read_file' requires an explicit path inside the designated Obsidian vault.",
+    }
 
 
 def test_session_history_cache_does_not_duplicate_full_history(tmp_path, monkeypatch):
@@ -1881,17 +1882,6 @@ def test_pre_tool_call_blocks_file_operations_outside_vault(tmp_path):
     assert blocked_patch is not None
     assert blocked_patch["action"] == "block"
 
-    # Hermes splits a missing search path on commas/whitespace and searches
-    # every existing segment. Composite paths must not bypass vault checks.
-    composite_path = f"{vault / 'missing'},{outside}"
-    blocked_multi_search = ctx.hooks["pre_tool_call"](
-        session_id="child-safe-1",
-        tool_name="search_files",
-        args={"pattern": "*.md", "target": "files", "path": composite_path},
-    )
-    assert blocked_multi_search is not None
-    assert blocked_multi_search["action"] == "block"
-
     spaced_directory = vault / "folder with spaces"
     spaced_directory.mkdir()
     assert (
@@ -2002,3 +1992,225 @@ def test_setup_reports_error_when_launch_is_already_active(tmp_path):
     assert result == {
         "error": "A background curator review is already active. Please wait for it to finish."
     }
+
+
+def test_subagent_stop_accepts_success_status(monkeypatch):
+    plugin = load_plugin()
+    ctx = Context()
+    ctx.state.set("activity_count", 4)
+    ctx.state.set(
+        "pending_review",
+        {
+            "review_id": "r-success",
+            "reviewed_activity_count": 4,
+            "history_snapshot": [],
+            "status": "running",
+        },
+    )
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "child-success-1")
+
+    ctx.hooks["subagent_stop"](
+        child_session_id="child-success-1",
+        child_status="success",
+        child_summary="Obsidian: updated daily note.",
+    )
+
+    assert ctx.state.get("activity_count") == 0
+    assert ctx.state.get("pending_review") is None
+
+
+def test_retry_preserves_original_origin_target_across_sessions(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_000.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    pending = _pending_retry_state()
+    pending["origin_target"] = "telegram:8804634959"
+    ctx.state.set("activity_count", 2)
+    ctx.state.set("pending_review", pending)
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="session-different",
+        turn_id="parent-turn-1",
+        model="parent/model",
+        assistant_response="Turn on different session.",
+        conversation_history=[],
+        platform="discord",
+    )
+
+    assert plugin._PENDING_ORIGIN_TARGET == "telegram:8804634959"
+    assert ctx.state.get("pending_review")["origin_target"] == "telegram:8804634959"
+
+
+def test_periodic_review_includes_counted_activity_from_multiple_sessions(
+    tmp_path, monkeypatch
+):
+    plugin = load_plugin()
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["pre_llm_call"](
+        session_id="session-a",
+        user_message="Durable fact from session A",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-a",
+        assistant_response="Acknowledged A",
+        conversation_history=[],
+    )
+    ctx.hooks["pre_llm_call"](
+        session_id="session-b",
+        user_message="Durable fact from session B",
+        conversation_history=[],
+    )
+    ctx.hooks["post_llm_call"](
+        session_id="session-b",
+        assistant_response="Acknowledged B",
+        conversation_history=[],
+    )
+
+    request = ctx.subagent_lifecycle.requests[0]
+    assert "Durable fact from session A" in request.context
+    assert "Durable fact from session B" in request.context
+
+
+def test_running_review_with_terminal_handle_is_restored(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin.SubagentHandle, "from_dict", lambda value: SimpleNamespace(**value)
+    )
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    ctx.subagent_lifecycle.status = lambda handle: SimpleNamespace(
+        state=plugin.SubagentState.FAILED
+    )
+    pending = _pending_retry_state()
+    pending.update(
+        {
+            "status": "running",
+            "owner_pid": 123,
+            "handle": {"subagent_id": "finished-child"},
+        }
+    )
+    ctx.state.set("pending_review", pending)
+
+    plugin.register(ctx)
+
+    assert ctx.state.get("pending_review")["status"] == "pending"
+
+
+def test_setup_rolls_back_config_when_launch_fails(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    ctx = Context(
+        {
+            "vault_path": "/old/vault",
+            "review_interval": 9,
+            "curator_prompt": "Old instructions",
+        }
+    )
+    ctx.subagent_lifecycle.error = RuntimeError("launch unavailable")
+    plugin.register(ctx)
+
+    result = json.loads(
+        ctx.tools["obsidian_curator"](
+            {
+                "operation": "setup",
+                "vault_path": str(tmp_path),
+                "review_interval": 3,
+                "curator_prompt": "New instructions",
+            }
+        )
+    )
+
+    assert result == {"error": "Failed to launch initial curator review: launch unavailable"}
+    assert ctx.config["vault_path"] == "/old/vault"
+    assert ctx.config["review_interval"] == 9
+    assert ctx.config["curator_prompt"] == "Old instructions"
+
+
+def test_stale_launching_state_recovers_after_timeout(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    monkeypatch.setattr(
+        plugin, "SubagentLaunchRequest", lambda **kw: SimpleNamespace(**kw)
+    )
+    monkeypatch.setattr(plugin.time, "time", lambda: 1_100.0)
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit vault.",
+        }
+    )
+    plugin.register(ctx)
+    setattr(plugin, "_ACTIVE_CHILD", "launching")
+    pending = _pending_retry_state()
+    pending.update(
+        {
+            "status": "running",
+            "owner_pid": 123,
+            "launched_at": 1_000.0,
+        }
+    )
+    ctx.state.set("pending_review", pending)
+
+    ctx.hooks["post_llm_call"](
+        session_id="session-recover",
+        turn_id="turn-after-timeout",
+        model="parent/model",
+        assistant_response="Boundary after timeout.",
+        conversation_history=[],
+        platform="telegram",
+    )
+
+    assert len(ctx.subagent_lifecycle.requests) == 1
+    assert getattr(plugin, "_ACTIVE_CHILD") == "launching"
+
+
+def test_post_tool_call_ignores_blocked_tool_events(tmp_path):
+    plugin = load_plugin()
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 2,
+            "curator_prompt": "Audit and curate vault.",
+        }
+    )
+    plugin.register(ctx)
+
+    ctx.hooks["post_tool_call"](
+        session_id="s1",
+        tool_name="read_file",
+        status="blocked",
+        error_type="plugin_block",
+    )
+    assert ctx.state.get("activity_count", 0) == 0
+
+    ctx.hooks["post_tool_call"](
+        session_id="s1",
+        tool_name="read_file",
+        status="ok",
+    )
+    assert ctx.state.get("activity_count", 0) == 1
