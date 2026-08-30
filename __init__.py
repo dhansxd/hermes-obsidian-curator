@@ -465,12 +465,6 @@ def _launch(
                     ),
                     role="leaf",
                     allowed_toolsets=allowed_toolsets,
-                    blocked_tools=tuple(
-                        dict.fromkeys(
-                            _ALWAYS_BLOCKED_TOOLS
-                            + tuple(str(t) for t in (settings.get("blocked_tools") or []))
-                        )
-                    ),
                     model=model_override,
                     parent_session_id=session_id or None,
                     correlation_id=str(pending["review_id"]),

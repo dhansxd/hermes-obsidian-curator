@@ -1634,9 +1634,49 @@ def test_subagent_stop_normalizes_report_prefix_to_note_emoji(monkeypatch):
     ]
 
 
+def test_launch_request_conforms_to_hermes_core_validation(tmp_path):
+    plugin = load_plugin()
+    from agent.subagent_lifecycle import SubagentLifecycleService
+
+    captured_requests = []
+
+    class RealValidatingLifecycle:
+        def launch(self, req):
+            SubagentLifecycleService._validate_request(req, SimpleNamespace(session_id="parent-sess"))
+            captured_requests.append(req)
+            return SimpleNamespace(to_dict=lambda: {"subagent_id": "sa-valid-1"})
+
+    ctx = Context(
+        {
+            "vault_path": str(tmp_path),
+            "review_interval": 1,
+            "curator_prompt": "Audit and curate vault.",
+            "blocked_tools": ["terminal"],
+        }
+    )
+    ctx.subagent_lifecycle = RealValidatingLifecycle()
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](
+        session_id="parent-sess",
+        platform="telegram",
+        conversation_history=[{"role": "user", "content": "Update note"}],
+    )
+
+    assert len(captured_requests) == 1
+    assert captured_requests[0].role == "leaf"
+    assert captured_requests[0].allowed_toolsets == ("file", "skills")
+    assert captured_requests[0].blocked_tools == ()
+
+
 def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
     plugin = load_plugin()
-    monkeypatch.setattr(plugin, "SubagentLaunchRequest", SimpleNamespace)
+
+    def lifecycle_request(**kwargs):
+        assert "blocked_tools" not in kwargs
+        return SimpleNamespace(**kwargs)
+
+    monkeypatch.setattr(plugin, "SubagentLaunchRequest", lifecycle_request)
     ctx = Context()
     plugin.register(ctx)
 
@@ -1663,7 +1703,7 @@ def test_setup_accepts_and_applies_flexible_capabilities(tmp_path, monkeypatch):
 
     req = ctx.subagent_lifecycle.requests[0]
     assert req.allowed_toolsets == ("file", "skills")
-    assert req.blocked_tools == ("delegate_task", "skill_manage", "terminal")
+    assert not hasattr(req, "blocked_tools")
     assert req.model == "claude-3-5-sonnet-20241022"
     assert "skill_view" in req.goal
     assert "obsidian" in req.goal
