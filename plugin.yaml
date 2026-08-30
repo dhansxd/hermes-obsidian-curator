@@ -1,8 +1,8 @@
 name: obsidian-curator
-version: 0.7.0
+version: 0.8.0
 manifest_version: 1
 
-description: "One native standalone Hermes agent whose only task is Obsidian curation."
+description: "Turn-triggered Obsidian curation using Hermes' native cron runner."
 author: Dani & Dyra
 provides_tools:
   - obsidian_curator
@@ -31,20 +31,32 @@ config_schema:
     type: bool
     default: true
     description: "Whether completed tool calls count towards review_interval."
-  allowed_toolsets:
+  enabled_toolsets:
     type: list
     default:
       - file
       - skills
-    description: "Fixed curator toolsets; only file and skills are accepted."
+    description: "Toolsets passed directly to the native cron runner."
   blocked_tools:
     type: list
     default: []
-    description: "List of individual tool names blocked for the curator subagent."
+    description: "List of individual tool names blocked for the curator."
   skills:
     type: list
     default: []
-    description: "List of skills to preload before each curation pass."
+    description: "List of skills preloaded by the native cron runner."
   model_override:
     type: str
-    description: "Custom model override for the background curator agent (default null = inherit parent session model)."
+    description: "Model override passed directly to the native cron runner."
+  provider:
+    type: str
+    description: "Provider override passed directly to the native cron runner."
+  base_url:
+    type: str
+    description: "Base URL override passed directly to the native cron runner."
+  reasoning_effort:
+    type: str
+    description: "Reasoning effort passed directly to the native cron runner."
+  workdir:
+    type: str
+    description: "Working directory passed directly to the native cron runner."
