@@ -8,7 +8,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 _MARKER = "OBSIDIAN_CURATOR_BACKGROUND_AGENT"
 _JOB_ID_PREFIX = "obsidian_curator_"
@@ -40,33 +40,29 @@ _SESSION_HISTORIES: dict[str, list[dict[str, str]]] = {}
 _FINALIZED_SESSIONS: set[str] = set()
 _ACTIVE_THREAD: threading.Thread | None = None
 _CTX: Any = None
-_PARENT_NOTIFIER: Callable[[str], Any] | None = None
 
 
-def _send_message_tool(args: dict[str, Any]) -> str:
-    try:
-        from tools.send_message_tool import send_message_tool
-
-        return str(send_message_tool(args))
-    except Exception as exc:
-        return json.dumps({"error": str(exc)})
-
-
-def _resolve_origin_target(session_id: str, platform: str = "") -> str | None:
+def _origin_from_env() -> dict[str, Any] | None:
     try:
         from gateway.session_context import get_session_env
 
-        internal = {"", "cli", "cron", "desktop", "local", "subagent", "obsidian_curator"}
-        requested = str(platform or "").strip().lower()
-        session_platform = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
-        plat = session_platform if requested in internal else requested
+        plat = str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
         chat_id = str(get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
-        thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
-        if plat not in internal and chat_id:
-            return f"{plat}:{chat_id}:{thread_id}" if thread_id else f"{plat}:{chat_id}"
+        internal = {"", "cli", "cron", "desktop", "local", "subagent", "obsidian_curator"}
+        if plat in internal or not chat_id:
+            return None
+        thread_id = str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip() or None
+        user_id = str(get_session_env("HERMES_SESSION_USER_ID", "") or "").strip() or None
+        chat_name = str(get_session_env("HERMES_SESSION_CHAT_NAME", "") or "").strip() or None
+        return {
+            "platform": plat,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "chat_name": chat_name,
+        }
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _prompt(vault: Path, session_id: str, curator_prompt: str, *, initial_setup: bool) -> str:
@@ -218,23 +214,49 @@ def _format_summary(raw: str, default: str = "curation completed.") -> str:
     return f"📝 Obsidian Review: {summary or default}"
 
 
-def _deliver_notification(summary: str, origin_target: str | None) -> bool:
-    if origin_target:
-        try:
-            raw = _send_message_tool({"action": "send", "target": origin_target, "message": summary})
-            data = json.loads(raw) if isinstance(raw, str) else raw
-            if isinstance(data, dict) and data.get("error"):
-                return False
-            return True
-        except Exception:
-            return False
-    if _PARENT_NOTIFIER:
-        try:
-            _PARENT_NOTIFIER(summary)
-            return True
-        except Exception:
-            return False
-    return True
+def _session_origins(ctx: Any) -> dict[str, dict[str, Any]]:
+    if ctx is None:
+        return {}
+    try:
+        origins = ctx.state.get("session_origins")
+        if isinstance(origins, dict):
+            return {str(k): dict(v) for k, v in origins.items() if str(k).strip() and isinstance(v, dict)}
+    except Exception:
+        pass
+    return {}
+
+
+def _set_session_origin(ctx: Any, session_id: str, origin: dict[str, Any] | None) -> None:
+    if ctx is None or not session_id:
+        return
+    origins = _session_origins(ctx)
+    if origin:
+        origins[session_id] = origin
+    else:
+        origins.pop(session_id, None)
+    try:
+        ctx.state.set("session_origins", origins)
+    except Exception:
+        pass
+
+
+def _legacy_platform_origin(ctx: Any, platform: str) -> dict[str, Any] | None:
+    if ctx is None or not platform:
+        return None
+    try:
+        queues = ctx.state.get("platform_queues")
+        entry = queues.get(platform) if isinstance(queues, dict) else None
+        target = str(entry.get("origin_target") or "") if isinstance(entry, dict) else ""
+        parts = target.split(":", 2)
+        if len(parts) >= 2 and parts[0] and parts[1]:
+            return {
+                "platform": parts[0],
+                "chat_id": parts[1],
+                "thread_id": parts[2] if len(parts) == 3 and parts[2] else None,
+            }
+    except Exception:
+        pass
+    return None
 
 
 def _session_counts(ctx: Any) -> dict[str, int]:
@@ -290,10 +312,11 @@ def _set_persisted_queue(ctx: Any, items: list[dict[str, Any]]) -> None:
         pass
 
 
-def _cron_job(settings: dict[str, Any], prompt: str) -> dict[str, Any]:
+def _cron_job(settings: dict[str, Any], prompt: str, origin: dict[str, Any] | None) -> dict[str, Any]:
     toolsets = settings.get("enabled_toolsets")
     if toolsets is None:
         toolsets = list(_ALLOWED_TOOLSETS)
+    deliver = "origin" if origin else "local"
     return {
         "id": f"{_JOB_ID_PREFIX}{uuid.uuid4().hex}",
         "name": "Obsidian curator",
@@ -305,15 +328,15 @@ def _cron_job(settings: dict[str, Any], prompt: str) -> dict[str, Any]:
         "enabled_toolsets": [str(t) for t in toolsets],
         "reasoning_effort": settings.get("reasoning_effort") or None,
         "workdir": settings.get("workdir") or None,
-        "deliver": "local",
-        "origin": None,
+        "deliver": deliver,
+        "origin": origin,
         "no_agent": False,
     }
 
 
 def _worker() -> None:
     global _ACTIVE_THREAD
-    from cron.scheduler import run_job
+    from cron.scheduler import _deliver_result, run_job
 
     while True:
         ctx = _CTX
@@ -344,22 +367,27 @@ def _worker() -> None:
             continue
 
         session_id = str(item.get("session_id") or "")
+        job = item["job"]
         try:
-            success, _, final_response, error = run_job(item["job"])
+            success, _, final_response, error = run_job(job)
         except Exception as exc:
             success, final_response, error = False, "", str(exc)
 
         summary = _format_summary(final_response if success else error or final_response, "curation failed.")
-        delivered = _deliver_notification(summary, item.get("origin_target")) if (success or not item.get("silent_on_failure")) else False
+        delivery_error = None
+        if success or not item.get("silent_on_failure"):
+            delivery_error = _deliver_result(job, summary)
 
         with _LOCK:
-            if success:
+            if success and delivery_error is None:
                 current = _get_activity_count(ctx, session_id)
                 remaining = max(0, current - int(item.get("reviewed_count", 0) or 0))
                 _set_activity_count(ctx, session_id, remaining)
+                if remaining == 0:
+                    _set_session_origin(ctx, session_id, None)
                 _cleanup_session_history(session_id)
                 if remaining > 0 and session_id in _FINALIZED_SESSIONS:
-                    _launch(session_id, initial_setup=False, origin_target=item.get("origin_target"))
+                    _launch(session_id, initial_setup=False, origin=job.get("origin"))
             else:
                 attempts = int(item.get("attempts", 1) or 1)
                 if attempts < _MAX_RETRY_ATTEMPTS:
@@ -369,8 +397,9 @@ def _worker() -> None:
                     queue.append(item)
                     _set_persisted_queue(ctx, queue)
                 else:
-                    if not delivered:
-                        _deliver_notification(_format_summary(error or "curation failed after retries.", "curation failed permanently."), item.get("origin_target"))
+                    if delivery_error and job.get("origin"):
+                        _deliver_result(job, _format_summary(error or "curation failed after retries.", "curation failed permanently."))
+                    _set_session_origin(ctx, session_id, None)
                     _cleanup_session_history(session_id)
 
 
@@ -382,7 +411,7 @@ def _ensure_worker_running() -> None:
             _ACTIVE_THREAD.start()
 
 
-def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any = None, origin_target: str | None = None) -> bool:
+def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any = None, origin: dict[str, Any] | None = None) -> bool:
     ctx = _CTX
     if ctx is None or not session_id:
         return False
@@ -408,12 +437,12 @@ def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any =
     if context:
         prompt = f"{prompt}\n\n{context}"
 
+    effective_origin = origin or _session_origins(ctx).get(session_id) or _origin_from_env()
     item = {
         "id": f"rev_{uuid.uuid4().hex}",
         "session_id": session_id,
         "reviewed_count": _get_activity_count(ctx, session_id),
-        "origin_target": origin_target or _resolve_origin_target(session_id),
-        "job": _cron_job(settings, prompt),
+        "job": _cron_job(settings, prompt, effective_origin),
         "attempts": 1,
         "next_retry_at": 0,
         "created_at": time.time(),
@@ -431,12 +460,16 @@ def _launch(session_id: str, *, initial_setup: bool, conversation_history: Any =
 def _record_activity(event: dict[str, Any], source_type: str) -> None:
     ctx = _CTX
     session_id = str(event.get("session_id") or "")
-    if ctx is None or not session_id or str(event.get("platform") or "").lower() == "cron":
+    platform = str(event.get("platform") or "").lower()
+    if ctx is None or not session_id or platform == "cron":
         return
     settings = _settings(ctx)
     if not settings["vault_path"] or not settings[f"trigger_on_{source_type}s"] or _review_interval(ctx) is None:
         return
     with _LOCK:
+        origin = _origin_from_env()
+        if origin:
+            _set_session_origin(ctx, session_id, origin)
         _set_activity_count(ctx, session_id, _get_activity_count(ctx, session_id) + 1)
 
 
@@ -447,7 +480,7 @@ def _trigger_if_due(event: dict[str, Any]) -> None:
         return
     interval = _review_interval(ctx)
     if interval and _get_activity_count(ctx, session_id) >= interval:
-        _launch(session_id, initial_setup=False, origin_target=_resolve_origin_target(session_id, str(event.get("platform") or "")))
+        _launch(session_id, initial_setup=False, origin=_session_origins(ctx).get(session_id) or _origin_from_env())
 
 
 def _on_pre_llm_call(**event: Any) -> None:
@@ -487,7 +520,13 @@ def _flush_session(event: dict[str, Any]) -> None:
     with _LOCK:
         _FINALIZED_SESSIONS.add(session_id)
     if ctx is not None and _get_activity_count(ctx, session_id) > 0:
-        _launch(session_id, initial_setup=False, origin_target=_resolve_origin_target(session_id, str(event.get("platform") or "")))
+        platform = str(event.get("platform") or "").lower()
+        origin = (
+            _session_origins(ctx).get(session_id)
+            or _origin_from_env()
+            or _legacy_platform_origin(ctx, platform)
+        )
+        _launch(session_id, initial_setup=False, origin=origin)
     else:
         _cleanup_session_history(session_id)
 

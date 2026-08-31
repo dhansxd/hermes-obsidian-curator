@@ -47,13 +47,28 @@ class Context:
 
 
 def install_cron_mock(monkeypatch, result=(True, "doc", "Obsidian review complete.", None)):
-    calls = []
+    class CronTracker(list):
+        def __init__(self):
+            super().__init__()
+            self.runs = []
+            self.deliveries = []
+
+    calls = CronTracker()
 
     def run_job(job):
         calls.append(job)
+        calls.runs.append(job)
         return result
 
-    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job, tick=lambda *args, **kwargs: None))
+    def deliver_result(job, content, **kwargs):
+        calls.deliveries.append({"job": job, "content": content})
+        return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "cron.scheduler",
+        SimpleNamespace(run_job=run_job, _deliver_result=deliver_result, tick=lambda *args, **kwargs: None),
+    )
     return calls
 
 
@@ -150,6 +165,24 @@ def test_interval_trigger_uses_cron_runner(tmp_path, monkeypatch):
     assert ctx.state.get("session_activity_counts", {}) == {}
 
 
+def test_interval_twenty_triggers_exactly_on_twentieth_turn(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    for turn in range(19):
+        ctx.hooks["post_llm_call"](session_id="s20", assistant_response=str(turn), platform="telegram")
+    assert not calls
+    assert ctx.state.get("session_activity_counts") == {"s20": 19}
+
+    ctx.hooks["post_llm_call"](session_id="s20", assistant_response="twenty", platform="telegram")
+    wait(plugin)
+
+    assert len(calls) == 1
+    assert ctx.state.get("session_activity_counts") == {}
+
+
 def test_cron_activity_is_ignored(tmp_path, monkeypatch):
     plugin = load_plugin()
     calls = install_cron_mock(monkeypatch)
@@ -210,6 +243,49 @@ def test_shutdown_or_exit_finalize_does_not_flush_session(tmp_path, monkeypatch)
     assert ctx.state.get("session_activity_counts") == {"session-a": 1}
 
 
+def test_finalize_uses_native_origin_saved_during_whatsapp_turn(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    env = {
+        "HERMES_SESSION_PLATFORM": "whatsapp",
+        "HERMES_SESSION_CHAT_ID": "2362534006947@lid",
+        "HERMES_SESSION_THREAD_ID": "",
+    }
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.session_context",
+        SimpleNamespace(get_session_env=lambda name, default="": env.get(name, default)),
+    )
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    plugin.register(ctx)
+
+    ctx.hooks["post_llm_call"](session_id="session-a", assistant_response="A activity", platform="whatsapp")
+    assert ctx.state.get("session_origins")["session-a"]["chat_id"] == "2362534006947@lid"
+    env.clear()
+    ctx.hooks["on_session_finalize"](session_id="session-a", reason="new_session", platform="whatsapp")
+    wait(plugin)
+
+    job = calls[0]
+    assert job["deliver"] == "origin"
+    assert job["origin"]["platform"] == "whatsapp"
+    assert calls.deliveries[0]["job"] is job
+
+
+def test_finalize_migrates_legacy_platform_origin(tmp_path, monkeypatch):
+    plugin = load_plugin()
+    calls = install_cron_mock(monkeypatch)
+    ctx = Context({"vault_path": str(tmp_path), "review_interval": 20, "curator_prompt": "Audit vault."})
+    ctx.state.set("platform_queues", {"telegram": {"origin_target": "telegram:8804634959"}})
+    ctx.state.set("session_activity_counts", {"old-session": 1})
+    plugin.register(ctx)
+
+    ctx.hooks["on_session_finalize"](old_session_id="old-session", reason="new_session", platform="telegram")
+    wait(plugin)
+
+    assert calls[0]["origin"] == {"platform": "telegram", "chat_id": "8804634959", "thread_id": None}
+    assert calls[0]["deliver"] == "origin"
+
+
 def test_format_summary_extracts_final_marker_and_strips_preamble():
     plugin = load_plugin()
     raw = (
@@ -223,14 +299,13 @@ def test_format_summary_extracts_final_marker_and_strips_preamble():
 def test_due_sessions_are_queued_and_run_sequentially(tmp_path, monkeypatch):
     plugin = load_plugin()
     calls = install_cron_mock(monkeypatch)
-    monkeypatch.setattr(plugin, "_deliver_notification", lambda *_: True)
     ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
     plugin.register(ctx)
 
     plugin._record_activity({"session_id": "telegram-a", "platform": "telegram"}, "turn")
     plugin._record_activity({"session_id": "whatsapp-b", "platform": "whatsapp"}, "turn")
-    assert plugin._launch("telegram-a", initial_setup=False, origin_target="telegram:1")
-    assert plugin._launch("whatsapp-b", initial_setup=False, origin_target="whatsapp:2")
+    assert plugin._launch("telegram-a", initial_setup=False, origin={"platform": "telegram", "chat_id": "1"})
+    assert plugin._launch("whatsapp-b", initial_setup=False, origin={"platform": "whatsapp", "chat_id": "2"})
     wait(plugin)
 
     assert len(calls) == 2
@@ -247,11 +322,15 @@ def test_turn_added_during_run_survives_review(tmp_path, monkeypatch):
         release.wait(timeout=2)
         return True, "doc", "done", None
 
-    monkeypatch.setitem(sys.modules, "cron.scheduler", SimpleNamespace(run_job=run_job, tick=lambda *args, **kwargs: None))
+    monkeypatch.setitem(
+        sys.modules,
+        "cron.scheduler",
+        SimpleNamespace(run_job=run_job, _deliver_result=lambda *args, **kwargs: None, tick=lambda *args, **kwargs: None),
+    )
     ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
     plugin.register(ctx)
     plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
-    assert plugin._launch("s1", initial_setup=False, origin_target="telegram:1")
+    assert plugin._launch("s1", initial_setup=False, origin={"platform": "telegram", "chat_id": "1"})
     assert started.wait(timeout=1)
     plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
     release.set()
@@ -263,11 +342,10 @@ def test_turn_added_during_run_survives_review(tmp_path, monkeypatch):
 def test_failed_review_is_persisted_for_retry(tmp_path, monkeypatch):
     plugin = load_plugin()
     install_cron_mock(monkeypatch, result=(False, "doc", "", "Rate limited"))
-    monkeypatch.setattr(plugin, "_deliver_notification", lambda *_: True)
     ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
     plugin.register(ctx)
     plugin._record_activity({"session_id": "s1", "platform": "telegram"}, "turn")
-    assert plugin._launch("s1", initial_setup=False, origin_target="telegram:1")
+    assert plugin._launch("s1", initial_setup=False, origin={"platform": "telegram", "chat_id": "1"})
     wait(plugin)
 
     queue = ctx.state.get("pending_reviews")
@@ -281,14 +359,19 @@ def test_failed_review_is_persisted_for_retry(tmp_path, monkeypatch):
 def test_pending_reviews_are_restored_on_register(tmp_path, monkeypatch):
     plugin = load_plugin()
     calls = install_cron_mock(monkeypatch)
-    monkeypatch.setattr(plugin, "_deliver_notification", lambda *_: True)
     ctx = Context({"vault_path": str(tmp_path), "review_interval": 1, "curator_prompt": "Audit vault."})
     ctx.state.set("pending_reviews", [{
         "id": "rev_saved",
         "session_id": "s1",
         "reviewed_count": 1,
-        "origin_target": "telegram:1",
-        "job": {"id": "cron_job_1", "prompt": "test", "deliver": "local", "no_agent": False},
+        "job": {
+            "id": "cron_job_1",
+            "name": "Obsidian curator",
+            "prompt": "test",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "1"},
+            "no_agent": False,
+        },
         "attempts": 1,
         "next_retry_at": 0,
     }])
