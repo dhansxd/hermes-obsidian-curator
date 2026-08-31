@@ -1,8 +1,8 @@
 name: obsidian-curator
-version: 0.9.0
+version: 1.0.0
 manifest_version: 1
 
-description: "Turn-triggered Obsidian curation using Hermes' native cron runner."
+description: "Turn-triggered Obsidian curation using Hermes' native cron scheduler."
 author: Dani & Dyra
 provides_tools:
   - obsidian_curator
